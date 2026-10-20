@@ -17,6 +17,8 @@ pub enum Profile {
     CLog3,
     FLog,
     FLog2,
+    /// F-Log2 curve with the wider F-Gamut C (GFX ETERNA 55).
+    FLog2C,
     NLog,
     LogC3,
     LogC4,
@@ -32,7 +34,7 @@ const REC709: [Xy; 3] = [(0.64, 0.33), (0.30, 0.60), (0.15, 0.06)];
 const REC2020: [Xy; 3] = [(0.708, 0.292), (0.170, 0.797), (0.131, 0.046)];
 
 impl Profile {
-    pub const ALL: [Profile; 14] = [
+    pub const ALL: [Profile; 15] = [
         Profile::Standard,
         Profile::VLog,
         Profile::SLog3Cine,
@@ -40,6 +42,7 @@ impl Profile {
         Profile::CLog3,
         Profile::FLog,
         Profile::FLog2,
+        Profile::FLog2C,
         Profile::NLog,
         Profile::LogC3,
         Profile::LogC4,
@@ -58,6 +61,7 @@ impl Profile {
             Profile::CLog3 => "Canon C-Log3",
             Profile::FLog => "Fujifilm F-Log",
             Profile::FLog2 => "Fujifilm F-Log2",
+            Profile::FLog2C => "Fujifilm F-Log2 C",
             Profile::NLog => "Nikon N-Log",
             Profile::LogC3 => "ARRI LogC3 (EI 800)",
             Profile::LogC4 => "ARRI LogC4",
@@ -78,6 +82,7 @@ impl Profile {
             Profile::CLog3 => "CLog3",
             Profile::FLog => "FLog",
             Profile::FLog2 => "FLog2",
+            Profile::FLog2C => "FLog2C",
             Profile::NLog => "NLog",
             Profile::LogC3 => "LogC3",
             Profile::LogC4 => "LogC4",
@@ -112,7 +117,8 @@ impl Profile {
         let runs: Vec<String> =
             (1..=3).flat_map(|k| words.windows(k).map(|w| w.concat()).collect::<Vec<_>>()).collect();
         // Most specific first.
-        const TOKENS: [(&str, Profile); 15] = [
+        const TOKENS: [(&str, Profile); 16] = [
+            ("flog2c", Profile::FLog2C),
             ("flog2", Profile::FLog2),
             ("flog", Profile::FLog),
             ("vlog", Profile::VLog),
@@ -140,7 +146,7 @@ impl Profile {
             Profile::SLog3Cine | Profile::SLog3 => 2,
             Profile::CLog3 => 3,
             Profile::FLog => 4,
-            Profile::FLog2 => 5,
+            Profile::FLog2 | Profile::FLog2C => 5,
             Profile::NLog => 6,
             Profile::LogC3 => 7,
             Profile::LogC4 => 8,
@@ -165,6 +171,8 @@ impl Profile {
             Profile::CLog3 => ([(0.740, 0.270), (0.170, 1.140), (0.080, -0.100)], D65),
             // F-Gamut, N-Log and Apple Log use Rec.2020 primaries.
             Profile::FLog | Profile::FLog2 | Profile::NLog | Profile::AppleLog => (REC2020, D65),
+            // Fujifilm GFX ETERNA white paper v1.01, p. 11.
+            Profile::FLog2C => ([(0.7347, 0.2653), (0.0263, 0.9737), (0.1173, -0.0224)], D65),
             Profile::LogC3 => ([(0.6840, 0.3130), (0.2210, 0.8480), (0.0861, -0.1020)], D65),
             Profile::LogC4 => ([(0.7347, 0.2653), (0.1424, 0.8576), (0.0991, -0.0308)], D65),
             Profile::BmdFilmGen5 => {
@@ -225,7 +233,7 @@ impl Profile {
                     8.735631 * l + 0.092864
                 }
             }
-            Profile::FLog2 => {
+            Profile::FLog2 | Profile::FLog2C => {
                 if l >= 0.000889 {
                     0.245281 * log10(5.555556 * l + 0.064829) + 0.384316
                 } else {
@@ -322,7 +330,7 @@ impl Profile {
                     (v - 0.092864) / 8.735631
                 }
             }
-            Profile::FLog2 => {
+            Profile::FLog2 | Profile::FLog2C => {
                 if v >= 0.100686685370811 {
                     (pow10((v - 0.384316) / 0.245281) - 0.064829) / 5.555556
                 } else {
@@ -378,7 +386,7 @@ impl Profile {
 /// (to Rec.709, from Rec.709) per profile, indexed by `Profile as usize`
 /// (declaration order = `Profile::ALL`). Derived once, in f64, from primaries.
 type M3f = [[f32; 3]; 3];
-static MATRICES: std::sync::LazyLock<[(M3f, M3f); 14]> = std::sync::LazyLock::new(|| {
+static MATRICES: std::sync::LazyLock<[(M3f, M3f); 15]> = std::sync::LazyLock::new(|| {
     Profile::ALL.map(|p| {
         let (prim, w) = p.gamut();
         let (cam, rec) = (npm(prim, w), npm(REC709, D65));
@@ -455,6 +463,9 @@ mod tests {
         let cases = [
             ("XH2S_FLog_FGamut_to_ETERNA_BT.709_33grid_V.1.00", Profile::FLog),
             ("X-T5_F-Log2_F-Gamut_to_WDR_BT.709", Profile::FLog2),
+            ("FLog2C_to_CLASSIC-CHROME_33grid_V.1.00", Profile::FLog2C),
+            ("FLog2_to_ETERNA-BB_33grid_V.1.00", Profile::FLog2),
+            ("FLog_to_FLog-709_33grid_V.1.00", Profile::FLog),
             ("VLog_to_V709_forV35_ver100", Profile::VLog),
             ("SLog3SGamut3.CineToLC-709", Profile::SLog3Cine),
             ("ARRI_LogC4_to_Rec709", Profile::LogC4),

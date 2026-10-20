@@ -146,7 +146,16 @@ fn load_raster(path: &Path) -> Result<Photo, String> {
 
 /// Scene-linear Rec.709 preview of a RAW.
 fn load_raw(path: &Path) -> Result<Photo, String> {
-    let raw = rawler::decode_file(path).map_err(|e| e.to_string())?;
+    let src = rawler::rawsource::RawSource::new(path).map_err(|e| e.to_string())?;
+    let params = rawler::decoders::RawDecodeParams::default();
+    let raw = rawler::decode(&src, &params).map_err(|e| e.to_string())?;
+    // Decoders such as Panasonic's leave `raw.orientation` at Normal; the EXIF
+    // Orientation tag is the reliable source (6/8 = portrait shots).
+    let exif_orientation = rawler::get_decoder(&src)
+        .and_then(|d| d.raw_metadata(&src, &params))
+        .ok()
+        .and_then(|m| m.exif.orientation)
+        .unwrap_or_else(|| raw.orientation.to_u16());
     // Everything but the final sRGB encode: we want linear camera-calibrated RGB.
     let dev = RawDevelop::new_with(&[
         ProcessingStep::Rescale,
@@ -163,7 +172,7 @@ fn load_raw(path: &Path) -> Result<Photo, String> {
     let (w, h) = (rgb.dim().w as u32, rgb.dim().h as u32);
     let linear = Photo { width: w, height: h, pixels: rgb.data.iter().map(|p| [p[0], p[1], p[2], 1.0]).collect() };
     // Downscale in linear light (physically correct averaging), then encode.
-    let orientation = Orientation::from_exif(raw.orientation.to_u16() as u8).unwrap_or(Orientation::NoTransforms);
+    let orientation = Orientation::from_exif(exif_orientation as u8).unwrap_or(Orientation::NoTransforms);
     let mut img = DynamicImage::ImageRgba32F(linear.downscaled(PREVIEW_MAX).to_image());
     img.apply_orientation(orientation);
     let mut photo = Photo::from_image(img.into_rgba32f());
@@ -201,4 +210,18 @@ pub fn inverse_view_transform(display_linear: [f32; 3]) -> [f32; 3] {
     // m²/W² + m(1 − y) − y = 0
     let m = (-(1.0 - y) + ((1.0 - y) * (1.0 - y) + 4.0 * y / w2).sqrt()) * w2 / 2.0;
     display_linear.map(|v| v.max(0.0) / y * m / VIEW_EXPOSURE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Portrait RAWs must come out portrait. Uses local sample files when
+    /// present (set VIBINGLUT_PORTRAIT_RAW), otherwise skips.
+    #[test]
+    fn portrait_raw_is_rotated() {
+        let Ok(path) = std::env::var("VIBINGLUT_PORTRAIT_RAW") else { return eprintln!("no sample, skipped") };
+        let Decoded::Raw(p) = Decoded::load(Path::new(&path)).unwrap() else { panic!("not a RAW") };
+        assert!(p.height > p.width, "{}×{} is landscape", p.width, p.height);
+    }
 }
