@@ -155,7 +155,13 @@ impl App {
 
     /// Sends the active source (photo or test chart) to the GPU and redraws.
     fn show_source(&mut self) {
-        let Some((img, profile)) = (if self.show_chart { &self.chart } else { &self.photo }) else { return };
+        let Some((img, profile)) = (if self.show_chart { &self.chart } else { &self.photo }) else {
+            // Nothing to show (e.g. chart turned off with no photo open).
+            self.ui.export.set_sensitive(false);
+            self.ui.info.set_label("");
+            self.ui.grade_stack.set_visible_child_name("empty");
+            return;
+        };
         // The shader decodes the profile the pixels were actually encoded in.
         self.grade.params.set_input(*profile);
         self.source_profile = *profile;
@@ -1046,17 +1052,26 @@ impl SimpleComponent for App {
             }
             Msg::Loaded(generation, ..) if generation != self.load_gen => {}
             Msg::Loaded(_, path, profile, Ok(photo)) => {
+                // Raster pixels don't depend on the profile, so take the current one
+                // (it may have changed while the file was loading).
+                let profile = if is_raw(&path) { profile } else { self.profile };
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.ui.window.set_title(Some(&format!("{name} — VibingLUT")));
                 self.photo_info = format!("{name} · {} · {}×{} anteprima", profile.name(), photo.width, photo.height);
+                // A new photo means you want to see it; a profile reload of the
+                // same one leaves the chart as it is.
+                let new_photo = self.path.as_ref() != Some(&path);
                 self.photo = Some((photo, profile));
                 self.path = Some(path);
-                // Opening a photo means you want to see it.
-                self.show_chart = false;
-                self.ui.chart_btn.set_active(false);
+                if new_photo && self.show_chart {
+                    self.show_chart = false;
+                    self.ui.chart_btn.set_active(false);
+                }
                 self.show_source();
             }
             Msg::Loaded(_, path, _, Err(e)) => {
+                // Profile changes must keep reloading the photo that is actually shown.
+                self.requested = self.path.clone();
                 self.ui.grade_stack.set_visible_child_name(if self.path.is_some() { "image" } else { "empty" });
                 self.toast(&format!("Impossibile aprire {}: {e}", path.display()));
             }
@@ -1117,6 +1132,9 @@ impl SimpleComponent for App {
                     self.refresh();
                 }
             }
+            // Ctrl+E fires even while the button is insensitive.
+            Msg::Export(_, _, What::Grade) if !self.has_source() => {}
+            Msg::Export(_, _, What::Lab) if self.lab_layers.is_empty() => {}
             Msg::Export(format, size, what) => {
                 let stem = match (what, &self.path) {
                     (What::Identity, _) => format!("hald_identity_{size}"),
@@ -1267,8 +1285,23 @@ impl SimpleComponent for App {
                 self.profile = profile;
                 // RAWs are rendered into the profile's signal, so reload the photo
                 // (even one still loading, which was started with the old profile).
-                if let Some(path) = self.requested.clone() {
-                    sender.input(Msg::OpenPath(path));
+                match self.requested.clone() {
+                    Some(path) if is_raw(&path) => sender.input(Msg::OpenPath(path)),
+                    // JPEG/PNG/TIFF pixels don't depend on the profile: just reinterpret them.
+                    _ => {
+                        if let Some((_, p)) = &mut self.photo {
+                            *p = profile;
+                        }
+                        if let Some(info) = self.photo_info.split(" · ").next().map(str::to_owned)
+                            && let Some((img, _)) = &self.photo
+                        {
+                            self.photo_info =
+                                format!("{info} · {} · {}×{} anteprima", profile.name(), img.width, img.height);
+                        }
+                        if !self.show_chart {
+                            self.show_source();
+                        }
+                    }
                 }
                 if self.show_chart {
                     sender.input(Msg::Chart(true));
@@ -1278,7 +1311,8 @@ impl SimpleComponent for App {
                 self.show_chart = on;
                 match &self.chart {
                     // The chart is encoded per profile; (re)build it off the main thread.
-                    Some((_, p)) if !on || *p == self.profile => self.show_source(),
+                    _ if !on => self.show_source(),
+                    Some((_, p)) if *p == self.profile => self.show_source(),
                     _ => {
                         let (s, profile) = (sender.input_sender().clone(), self.profile);
                         std::thread::spawn(move || s.emit(Msg::ChartReady(profile, test_chart(profile))));
@@ -1453,6 +1487,10 @@ fn export_menu(action: &str, with_identity: bool) -> gio::Menu {
         menu.append_section(Some("Strumenti"), &tools);
     }
     menu
+}
+
+fn is_raw(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| RAW_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
 }
 
 fn wheel_mut(p: &mut Params, i: usize) -> &mut [f32; 4] {

@@ -157,12 +157,16 @@ impl Lut3d {
         let img = image::open(path).map_err(|e| e.to_string())?.into_rgb32f();
         let level = (img.width() == img.height()).then(|| hald_level(img.width())).flatten();
         let level = level.ok_or("not a HALD CLUT image (side must be L³)")? as usize;
-        let data = img.pixels().map(|p| [p[0], p[1], p[2]]).collect();
-        Ok(Self { title: String::new(), size: level * level, data, format: Format::Hald })
+        let data: Vec<[f32; 3]> = img.pixels().map(|p| [p[0], p[1], p[2]]).collect();
+        let size = level * level;
+        if !looks_like_lattice(&data, size) {
+            return Err("not a HALD CLUT (a photo of HALD size?)".into());
+        }
+        Ok(Self { title: String::new(), size, data, format: Format::Hald })
     }
 
-    /// True for PNGs shaped like a HALD CLUT (reads only the header), so
-    /// preview images living next to LUTs are skipped instead of reported.
+    /// Cheap header check: square with an L³ side. Photos can pass it (512 = 8³),
+    /// so `read_hald` also checks the content.
     fn is_hald(path: &Path) -> bool {
         image::image_dimensions(path).is_ok_and(|(w, h)| w == h && hald_level(w).is_some())
     }
@@ -242,13 +246,33 @@ impl Lut3d {
         paths.sort_by_cached_key(|p| (group(p), p.file_name().map(|n| n.to_ascii_lowercase())));
         let (mut luts, mut errors) = (Vec::new(), Vec::new());
         for p in paths {
+            let png = Format::from_path(&p) == Some(Format::Hald);
+            // A PNG next to a .cube/.vlt of the same name is that LUT's preview.
+            if png && ["cube", "vlt", "CUBE", "VLT"].iter().any(|e| p.with_extension(e).exists()) {
+                continue;
+            }
             match Self::load(&p) {
                 Ok(l) => luts.push((group(&p), l)),
+                // Non-HALD PNGs are previews or artwork, not broken LUTs.
+                Err(_) if png => {}
                 Err(e) => errors.push(format!("{}: {e}", p.strip_prefix(dir).unwrap_or(&p).display())),
             }
         }
         (luts, errors)
     }
+}
+
+/// A colour lattice rises in red along its red axis for almost every line,
+/// whatever the look; a photo doesn't. Tolerates small grading dips.
+fn looks_like_lattice(data: &[[f32; 3]], n: usize) -> bool {
+    let (mut up, mut steps) = (0usize, 0usize);
+    for line in data.chunks_exact(n) {
+        for w in line.windows(2) {
+            steps += 1;
+            up += usize::from(w[1][0] >= w[0][0] - 0.02);
+        }
+    }
+    up * 10 >= steps * 9
 }
 
 /// Recursive LUT search. Hidden entries are skipped and symlinked
@@ -339,6 +363,12 @@ mod tests {
             std::fs::write(&p, &cube).unwrap();
         }
         std::fs::write(root.join("Film/bad.cube"), "LUT_3D_SIZE 2\n").unwrap();
+        // A 64×64 (HALD-sized) preview beside its LUT, and a noise "photo": both skipped.
+        let noise = ImageBuffer::from_fn(64, 64, |x, y| {
+            Rgb([((x * 7919 + y * 104729) % 251) as u8, (x % 256) as u8, (y % 256) as u8])
+        });
+        noise.save(root.join("b.png")).unwrap();
+        noise.save(root.join("photo.png")).unwrap();
         let (luts, errors) = Lut3d::load_dir(&root);
         std::fs::remove_dir_all(&root).unwrap();
         let got: Vec<_> = luts.iter().map(|(g, l)| format!("{g}/{}", l.title)).collect();

@@ -86,9 +86,15 @@ impl Step {
 
 /// Composes `layers` into a `size`³ LUT whose input is `input`. `bake`
 /// turns a grade into a LUT (it runs on the GPU, unknown to this module).
-/// A chain ends in whatever profile its last step outputs; a mix always
-/// outputs Rec.709 (outputs are blended display-referred).
-pub fn compose(input: Profile, layers: &[Layer], blend: Blend, size: usize, bake: &dyn Fn(&Grade) -> Lut3d) -> Lut3d {
+/// A chain ends in whatever profile its last step outputs. A mix blends the
+/// looks display-referred (Rec.709), then applies any conversion layers.
+pub fn compose(
+    input: Profile,
+    layers: &[Layer],
+    blend: Blend,
+    size: usize,
+    bake: &dyn Fn(&Grade) -> Arc<Lut3d>,
+) -> Lut3d {
     let steps: Vec<Step> = layers
         .iter()
         .map(|l| {
@@ -97,9 +103,7 @@ pub fn compose(input: Profile, layers: &[Layer], blend: Blend, size: usize, bake
                 Source::Lut(lut) => {
                     Step { lut: Some(lut.clone()), input: l.input, output: Profile::Standard, weight: w }
                 }
-                Source::Grade(g) => {
-                    Step { lut: Some(Arc::new(bake(g))), input: l.input, output: Profile::Standard, weight: w }
-                }
+                Source::Grade(g) => Step { lut: Some(bake(g)), input: l.input, output: Profile::Standard, weight: w },
                 Source::Convert(p) => Step { lut: None, input: *p, output: *p, weight: 1.0 },
             }
         })
@@ -119,15 +123,27 @@ pub fn compose(input: Profile, layers: &[Layer], blend: Blend, size: usize, bake
                 }
                 v
             }
-            Blend::Mix if total > 0.0 => {
-                let lab = steps.iter().filter(|s| s.lut.is_some()).fold([0.0; 3], |acc, s| {
-                    let y = convert(s.output, Profile::Standard, s.apply(input, *c));
-                    let l = to_oklab(y);
-                    std::array::from_fn(|k| acc[k] + l[k] * s.weight / total)
-                });
-                from_oklab(lab)
+            Blend::Mix => {
+                // Weighted average of the looks; when the weights sum below 1
+                // the remainder is the neutral image, so a single layer fades.
+                let neutral = convert(input, Profile::Standard, *c);
+                let mut v = if total > 0.0 {
+                    let lab = steps.iter().filter(|s| s.lut.is_some()).fold([0.0; 3], |acc, s| {
+                        let l = to_oklab(convert(s.output, Profile::Standard, s.apply(input, *c)));
+                        std::array::from_fn(|k| acc[k] + l[k] * s.weight / total)
+                    });
+                    mix_oklab(neutral, from_oklab(lab), total.min(1.0))
+                } else {
+                    neutral
+                };
+                // Conversions act on the mixed result, in stack order.
+                let mut at = Profile::Standard;
+                for s in steps.iter().filter(|s| s.lut.is_none()) {
+                    v = convert(at, s.output, v);
+                    at = s.output;
+                }
+                v
             }
-            Blend::Mix => convert(input, Profile::Standard, *c),
         }
         .map(|v| v.clamp(0.0, 1.0));
     }
@@ -183,7 +199,7 @@ fn from_oklab([l, a, b]: [f32; 3]) -> [f32; 3] {
 mod tests {
     use super::*;
 
-    fn no_bake(_: &Grade) -> Lut3d {
+    fn no_bake(_: &Grade) -> Arc<Lut3d> {
         unreachable!("no GPU sources in these tests")
     }
 
@@ -281,9 +297,21 @@ mod tests {
     fn mix_weights_are_normalised_and_symmetric() {
         let layer = |l: Arc<Lut3d>, w| Layer { source: Source::Lut(l), intensity: w, input: Profile::Standard };
         let id = Arc::new(Lut3d::identity(17, Format::Cube));
-        let a = compose(Profile::Standard, &[layer(warm(), 0.2), layer(id.clone(), 0.2)], Blend::Mix, 17, &no_bake);
-        let b = compose(Profile::Standard, &[layer(id, 0.9), layer(warm(), 0.9)], Blend::Mix, 17, &no_bake);
+        let mix = |layers: &[Layer]| compose(Profile::Standard, layers, Blend::Mix, 17, &no_bake);
+        // Once the weights reach 100%, only their ratio matters, not scale or order.
+        let a = mix(&[layer(warm(), 0.6), layer(id.clone(), 0.6)]);
+        let b = mix(&[layer(id.clone(), 0.9), layer(warm(), 0.9)]);
         assert!(close(&a, &b, 1e-5), "equal weights must not depend on scale or order");
+        // Below 100% the rest is neutral: one layer at w equals the chain at w.
+        let solo = mix(&[layer(warm(), 0.3)]);
+        let chain = compose(Profile::Standard, &[layer(warm(), 0.3)], Blend::Chain, 17, &no_bake);
+        assert!(close(&solo, &chain, 1e-5));
+        // A conversion layer in a mix re-encodes the mixed result.
+        let conv = Layer { source: Source::Convert(Profile::VLog), intensity: 1.0, input: Profile::VLog };
+        let to_vlog = mix(&[layer(warm(), 1.0), conv]);
+        let c = to_vlog.data[5];
+        let want = convert(Profile::Standard, Profile::VLog, warm().data[5]);
+        assert!((0..3).all(|k| (c[k] - want[k]).abs() < 1e-4), "{c:?} vs {want:?}");
     }
 
     #[test]

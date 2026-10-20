@@ -271,9 +271,22 @@ struct Worker {
     photo: Option<GpuPhoto>,
     thumb: Option<GpuPhoto>,
     luts: Vec<GpuLut>,
+    /// Last grade baked for the Lab, reused until the grade changes.
+    grade_lut: std::cell::RefCell<Option<(Grade, Arc<Lut3d>)>>,
 }
 
 impl Worker {
+    fn bake_cached(&self, gpu: &Gpu, g: &Grade) -> Arc<Lut3d> {
+        if let Some((cached, lut)) = &*self.grade_lut.borrow()
+            && cached == g
+        {
+            return lut.clone();
+        }
+        let lut = Arc::new(gpu.bake(g, lab::SOURCE_SIZE, String::new()));
+        *self.grade_lut.borrow_mut() = Some((g.clone(), lut.clone()));
+        lut
+    }
+
     fn handle(&mut self, gpu: &Gpu, job: Job, notify: &impl Fn(Done)) {
         match job {
             Job::SetPhoto(p) => {
@@ -302,12 +315,12 @@ impl Worker {
             Job::Lab { input, layers, blend, split } => {
                 let Some(ph) = &self.photo else { return };
                 // ponytail: 33³ preview lattice; exports compose at full size.
-                let lut = lab::compose(input, &layers, blend, 33, &|g| gpu.bake(g, lab::SOURCE_SIZE, String::new()));
+                let lut = lab::compose(input, &layers, blend, 33, &|g| self.bake_cached(gpu, g));
                 let rgba = gpu.apply_lut(ph, &gpu.upload_lut(&lut), split);
                 notify(Done::Lab { width: ph.width, height: ph.height, rgba });
             }
             Job::ExportLab { input, layers, blend, size, format, title, path } => {
-                let lut = lab::compose(input, &layers, blend, size, &|g| gpu.bake(g, lab::SOURCE_SIZE, String::new()));
+                let lut = lab::compose(input, &layers, blend, size, &|g| self.bake_cached(gpu, g));
                 notify(Done::Exported(Lut3d { title, format, ..lut }.save(&path).map(|_| path)));
             }
             Job::Export { grade, size, format, title, path } => {

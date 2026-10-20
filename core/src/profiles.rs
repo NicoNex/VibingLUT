@@ -91,8 +91,27 @@ impl Profile {
     /// Best guess of the input profile a LUT file was made for, from its
     /// name (vendors put it there, e.g. `XH2S_FLog_FGamut_to_ETERNA_BT.709`).
     pub fn guess_from_name(name: &str) -> Profile {
-        let n: String = name.to_ascii_lowercase().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-        // Longest / most specific tokens first.
+        // Split into words (separators and camelCase), then match whole words
+        // or runs of up to three adjacent words ("F-Log", "S-Gamut3.Cine"), so
+        // creative names like "Analog" never read as a log profile.
+        let mut words: Vec<String> = Vec::new();
+        let mut prev: Option<char> = None;
+        for c in name.chars() {
+            if !c.is_ascii_alphanumeric() {
+                prev = None;
+                continue;
+            }
+            let boundary =
+                prev.is_none_or(|p| (p.is_ascii_lowercase() || p.is_ascii_digit()) && c.is_ascii_uppercase());
+            if boundary {
+                words.push(String::new());
+            }
+            words.last_mut().expect("pushed above").push(c.to_ascii_lowercase());
+            prev = Some(c);
+        }
+        let runs: Vec<String> =
+            (1..=3).flat_map(|k| words.windows(k).map(|w| w.concat()).collect::<Vec<_>>()).collect();
+        // Most specific first.
         const TOKENS: [(&str, Profile); 15] = [
             ("flog2", Profile::FLog2),
             ("flog", Profile::FLog),
@@ -110,7 +129,7 @@ impl Profile {
             ("log3g10", Profile::Log3G10),
             ("applelog", Profile::AppleLog),
         ];
-        TOKENS.iter().find(|(t, _)| n.contains(t)).map_or(Profile::Standard, |(_, p)| *p)
+        TOKENS.iter().find(|(t, _)| runs.iter().any(|r| r == t)).map_or(Profile::Standard, |(_, p)| *p)
     }
 
     /// Decoder id in `grade.wgsl` (0 = display-referred, no decode).
@@ -426,6 +445,10 @@ mod tests {
             ("SLog3SGamut3.CineToLC-709", Profile::SLog3Cine),
             ("ARRI_LogC4_to_Rec709", Profile::LogC4),
             ("Kodak 2383", Profile::Standard),
+            ("Kodak Analog Classic", Profile::Standard),
+            ("Teal&Orange_Vlogger", Profile::Standard),
+            ("Apple Log to Rec709", Profile::AppleLog),
+            ("Log3G10_RWG_to_709", Profile::Log3G10),
         ];
         for (name, want) in cases {
             assert_eq!(Profile::guess_from_name(name), want, "{name}");
