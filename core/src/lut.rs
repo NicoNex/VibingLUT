@@ -63,10 +63,26 @@ pub struct Lut3d {
     pub format: Format,
 }
 
-/// HALD level L for an image side, if the side is L³ (L in 2..=16).
+/// HALD level L for an image side, if the side is L³. Capped at 12
+/// (a 144³ cube, 1728² px): bigger ones cost hundreds of MB for no gain.
 fn hald_level(side: u32) -> Option<u32> {
-    (2..=16u32).find(|l| l * l * l == side)
+    (2..=12u32).find(|l| l * l * l == side)
 }
+
+/// A LUT in the library: everything but the lattice, which is loaded from
+/// `path` only when needed, so large libraries stay cheap.
+#[derive(Clone, Debug)]
+pub struct LutEntry {
+    pub path: std::path::PathBuf,
+    /// Sub-folder relative to the library root ("" at the top level).
+    pub group: String,
+    pub title: String,
+    pub format: Format,
+    pub size: usize,
+}
+
+/// Libraries larger than this are truncated (the UI says so).
+pub const MAX_LIBRARY: usize = 3000;
 
 impl Lut3d {
     /// The neutral N³ lattice.
@@ -236,10 +252,11 @@ impl Lut3d {
         Ok(lut)
     }
 
-    /// Every LUT (`.cube`, `.vlt`, HALD `.png`) under `dir`, recursively, paired with its sub-folder
-    /// relative to `dir` ("" for the top level), sorted by folder then name;
-    /// plus one message per file that failed to parse.
-    pub fn load_dir(dir: &Path) -> (Vec<(String, Self)>, Vec<String>) {
+    /// Every LUT (`.cube`, `.vlt`, HALD `.png`) under `dir`, recursively,
+    /// sorted by sub-folder then name (at most [`MAX_LIBRARY`]); plus one
+    /// message per file that failed to parse. Files are validated here but
+    /// their lattices are dropped.
+    pub fn load_dir(dir: &Path) -> (Vec<LutEntry>, Vec<String>) {
         let mut paths = Vec::new();
         collect_luts(dir, &mut paths);
         let group = |p: &Path| {
@@ -260,8 +277,13 @@ impl Lut3d {
             if png && siblings().is_some_and(|mut rd| rd.any(|e| e.is_ok_and(|e| text_lut_sibling(&e.path())))) {
                 continue;
             }
+            if luts.len() >= MAX_LIBRARY {
+                break;
+            }
             match Self::load(&p) {
-                Ok(l) => luts.push((group(&p), l)),
+                Ok(l) => {
+                    luts.push(LutEntry { group: group(&p), title: l.title, format: l.format, size: l.size, path: p })
+                }
                 // Non-HALD PNGs are previews or artwork, not broken LUTs.
                 Err(_) if png => {}
                 Err(e) => errors.push(format!("{}: {e}", p.strip_prefix(dir).unwrap_or(&p).display())),
@@ -380,7 +402,7 @@ mod tests {
         noise.save(root.join("photo.png")).unwrap();
         let (luts, errors) = Lut3d::load_dir(&root);
         std::fs::remove_dir_all(&root).unwrap();
-        let got: Vec<_> = luts.iter().map(|(g, l)| format!("{g}/{}", l.title)).collect();
+        let got: Vec<_> = luts.iter().map(|l| format!("{}/{}", l.group, l.title)).collect();
         let kodak = format!("Film{}Kodak/a", std::path::MAIN_SEPARATOR);
         assert_eq!(got, ["/b", "Film/z", kodak.as_str()]);
         assert_eq!(errors.len(), 1);

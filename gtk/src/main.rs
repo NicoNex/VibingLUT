@@ -15,7 +15,7 @@ use vibinglut_core::chart::test_chart;
 use vibinglut_core::gpu::{self, Done, Job};
 use vibinglut_core::grade::{Curve, Grade, Params};
 use vibinglut_core::lab::{Blend, Layer, Source, Stack};
-use vibinglut_core::lut::{Format, Lut3d};
+use vibinglut_core::lut::{Format, Lut3d, LutEntry, MAX_LIBRARY};
 use vibinglut_core::photo::{Decoded, Photo, RASTER_EXTS, RAW_EXTS};
 use vibinglut_core::profiles::Profile;
 use vibinglut_core::scopes::{HIST_H, HIST_W, Scopes, VEC_SIZE};
@@ -61,7 +61,7 @@ enum Msg {
     ExportTo(Format, usize, What, PathBuf),
     ChooseFolder,
     Folder(PathBuf),
-    GalleryLoaded(Vec<(String, Lut3d)>, Vec<String>),
+    GalleryLoaded(Vec<LutEntry>, Vec<String>),
     Group(u32),
     Preferences,
     Page(Page),
@@ -109,7 +109,8 @@ struct App {
     compare: bool,
     split: f32,
     path: Option<PathBuf>,
-    luts: Vec<Arc<Lut3d>>,
+    luts: Vec<LutEntry>,
+    lut_paths: Arc<Vec<PathBuf>>,
     /// Sub-folder of each LUT, and the distinct ones offered by the filter
     /// (filter index 0 = all, i = group_names[i - 1]).
     lut_groups: Vec<String>,
@@ -195,14 +196,14 @@ impl App {
 
     fn render_compare(&self) {
         if let (Some(i), true) = (self.selected, self.has_source()) {
-            self.send(Job::ApplyLut(i, self.split_value()));
+            self.send(Job::ApplyLut(self.luts[i].path.clone(), self.split_value()));
         }
     }
 
     fn render_gallery(&mut self) {
         if self.has_source() && !self.luts.is_empty() {
             self.gallery_gen += 1;
-            self.send(Job::Gallery(self.gallery_gen));
+            self.send(Job::Gallery(self.gallery_gen, self.lut_paths.clone()));
         }
     }
 
@@ -1007,6 +1008,7 @@ impl SimpleComponent for App {
             split: 0.5,
             path: None,
             luts: Vec::new(),
+            lut_paths: Arc::default(),
             lut_groups: Vec::new(),
             group_names: Vec::new(),
             page: Page::Grade,
@@ -1237,7 +1239,10 @@ impl SimpleComponent for App {
                 }
                 self.ui.flow.remove_all();
                 self.ui.thumbs.clear();
-                for (group, lut) in &luts {
+                if luts.len() >= MAX_LIBRARY {
+                    self.toast(&format!("Libreria molto grande: mostrati i primi {MAX_LIBRARY} LUT"));
+                }
+                for lut in &luts {
                     let pic = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).height_request(96).build();
                     let badge = gtk::Label::builder()
                         .label(lut.format.badge())
@@ -1257,7 +1262,7 @@ impl SimpleComponent for App {
                             .css_classes(["caption"])
                             .build(),
                     );
-                    let place = if group.is_empty() { String::new() } else { format!("{group} · ") };
+                    let place = if lut.group.is_empty() { String::new() } else { format!("{} · ", lut.group) };
                     card.set_tooltip_text(Some(&format!(
                         "{place}{} · {} {}³",
                         lut.title,
@@ -1268,7 +1273,7 @@ impl SimpleComponent for App {
                     self.ui.thumbs.push(pic);
                 }
                 self.ui.gallery_stack.set_visible_child_name(if luts.is_empty() { "empty" } else { "grid" });
-                self.lut_groups = luts.iter().map(|(g, _)| g.clone()).collect();
+                self.lut_groups = luts.iter().map(|l| l.group.clone()).collect();
                 self.group_names = self.lut_groups.clone();
                 self.group_names.dedup(); // sorted by group in core
                 let labels: Vec<String> = std::iter::once("Tutte le cartelle".to_string())
@@ -1281,8 +1286,8 @@ impl SimpleComponent for App {
                 let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
                 self.ui.groups.set_model(Some(&gtk::StringList::new(&labels)));
                 self.ui.groups.set_visible(self.group_names.iter().any(|g| !g.is_empty()));
-                self.luts = luts.into_iter().map(|(_, l)| Arc::new(l)).collect();
-                self.send(Job::SetLuts(self.luts.clone()));
+                self.lut_paths = Arc::new(luts.iter().map(|l| l.path.clone()).collect());
+                self.luts = luts;
                 self.selected = None;
                 self.ui.compare_stack.set_visible_child_name("empty");
                 self.render_gallery();
@@ -1333,9 +1338,12 @@ impl SimpleComponent for App {
             }
             Msg::LabAdd(add) => match add {
                 LabAdd::Selected => match self.selected.and_then(|i| self.luts.get(i)) {
-                    Some(lut) => {
-                        let lut = lut.clone();
-                        self.push_lab_lut(lut, &sender);
+                    Some(entry) => {
+                        let (p, s) = (entry.path.clone(), sender.input_sender().clone());
+                        std::thread::spawn(move || {
+                            let lut = Lut3d::load(&p);
+                            s.emit(Msg::LabLoaded(p, lut));
+                        });
                     }
                     None => self.toast("Seleziona prima un LUT in Confronta LUT"),
                 },

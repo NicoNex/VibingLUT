@@ -14,7 +14,7 @@ pub use rawler::imgop::srgb::{srgb_apply_gamma, srgb_invert_gamma};
 use crate::profiles::Profile;
 
 pub const PREVIEW_MAX: u32 = 2048;
-pub const THUMB_MAX: u32 = 384;
+pub const THUMB_MAX: u32 = 256;
 
 pub const RASTER_EXTS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff"];
 pub const RAW_EXTS: &[&str] = &[
@@ -94,28 +94,7 @@ impl Photo {
     /// values directly, so linear RAW data is downscaled in linear light.
     // ponytail: not image::imageops::thumbnail — it washes out f32 pixels.
     pub fn downscaled(&self, max: u32) -> Self {
-        let f = self.width.max(self.height).div_ceil(max).max(1);
-        if f == 1 {
-            return self.clone();
-        }
-        let (w, h) = ((self.width / f).max(1), (self.height / f).max(1));
-        let norm = 1.0 / (f * f) as f32;
-        let mut pixels = Vec::with_capacity((w * h) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let mut acc = [0.0f32; 4];
-                for dy in 0..f.min(self.height - y * f) {
-                    let row = ((y * f + dy) * self.width + x * f) as usize;
-                    for p in &self.pixels[row..row + f.min(self.width - x * f) as usize] {
-                        for c in 0..4 {
-                            acc[c] += p[c];
-                        }
-                    }
-                }
-                pixels.push(acc.map(|v| v * norm));
-            }
-        }
-        Self { width: w, height: h, pixels }
+        box_downscale(&self.pixels, self.width, self.height, max, |p| *p)
     }
 
     fn to_image(&self) -> Rgba32FImage {
@@ -126,6 +105,31 @@ impl Photo {
     fn from_image(img: Rgba32FImage) -> Self {
         Self { width: img.width(), height: img.height(), pixels: bytemuck::cast_slice(img.as_raw()).to_vec() }
     }
+}
+
+/// Integer-factor box filter over any pixel type convertible to RGBA.
+fn box_downscale<T>(src: &[T], width: u32, height: u32, max: u32, rgba: impl Fn(&T) -> [f32; 4]) -> Photo {
+    let f = width.max(height).div_ceil(max).max(1);
+    let (w, h) = ((width / f).max(1), (height / f).max(1));
+    let norm = 1.0 / (f * f) as f32;
+    let mut pixels = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = [0.0f32; 4];
+            let (rows, cols) = (f.min(height - y * f), f.min(width - x * f));
+            for dy in 0..rows {
+                let row = ((y * f + dy) * width + x * f) as usize;
+                for p in &src[row..row + cols as usize] {
+                    let p = rgba(p);
+                    for c in 0..4 {
+                        acc[c] += p[c];
+                    }
+                }
+            }
+            pixels.push(acc.map(|v| v * norm));
+        }
+    }
+    Photo { width: w, height: h, pixels }
 }
 
 fn load_raster(path: &Path) -> Result<Photo, String> {
@@ -170,10 +174,12 @@ fn load_raw(path: &Path) -> Result<Photo, String> {
         return Err("unsupported sensor layout".into());
     };
     let (w, h) = (rgb.dim().w as u32, rgb.dim().h as u32);
-    let linear = Photo { width: w, height: h, pixels: rgb.data.iter().map(|p| [p[0], p[1], p[2], 1.0]).collect() };
+    // Downscale straight from the 3-channel buffer: a full-size RGBA copy
+    // would add ~400 MB of peak memory on a 24 MP file.
+    let linear = box_downscale(&rgb.data, w, h, PREVIEW_MAX, |p| [p[0], p[1], p[2], 1.0]);
     // Downscale in linear light (physically correct averaging), then encode.
     let orientation = Orientation::from_exif(exif_orientation as u8).unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::ImageRgba32F(linear.downscaled(PREVIEW_MAX).to_image());
+    let mut img = DynamicImage::ImageRgba32F(linear.to_image());
     img.apply_orientation(orientation);
     let mut photo = Photo::from_image(img.into_rgba32f());
     for p in &mut photo.pixels {

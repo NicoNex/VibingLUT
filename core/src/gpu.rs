@@ -202,12 +202,12 @@ impl Gpu {
 
 pub enum Job {
     SetPhoto(Arc<Photo>),
-    /// Uploads the comparison LUTs once; later jobs refer to them by index.
-    SetLuts(Vec<Arc<Lut3d>>),
     Render(Grade, f32),
-    ApplyLut(usize, f32),
-    /// Thumbnails of every LUT; `generation` lets the UI drop stale results.
-    Gallery(u64),
+    /// The photo through the LUT file at `path` (kept on the GPU while selected).
+    ApplyLut(PathBuf, f32),
+    /// Thumbnails of the LUT files, read one at a time; `generation` lets
+    /// the UI drop stale results.
+    Gallery(u64, Arc<Vec<PathBuf>>),
     /// Preview of a LUT Lab stack on the current photo.
     Lab {
         stack: Stack,
@@ -266,7 +266,8 @@ struct Worker {
     source: Option<Arc<Photo>>,
     photo: Option<GpuPhoto>,
     thumb: Option<GpuPhoto>,
-    luts: Vec<GpuLut>,
+    /// The LUT shown in the comparison view.
+    selected: Option<(PathBuf, GpuLut)>,
     /// Last grade baked for the Lab, reused until the grade changes.
     grade_lut: std::cell::RefCell<Option<(Grade, Arc<Lut3d>)>>,
 }
@@ -294,22 +295,29 @@ impl Worker {
                 self.photo = Some(gpu.upload(&p));
                 self.source = Some(p);
             }
-            Job::SetLuts(luts) => self.luts = luts.iter().map(|l| gpu.upload_lut(l)).collect(),
             Job::Render(grade, split) => {
                 let Some(ph) = &self.photo else { return };
                 let rgba = gpu.render(ph, &grade, split);
                 let scopes = Scopes::compute(&rgba, ph.width, ph.height, split);
                 notify(Done::Graded { width: ph.width, height: ph.height, rgba, scopes });
             }
-            Job::ApplyLut(index, split) => {
-                let (Some(ph), Some(lut)) = (&self.photo, self.luts.get(index)) else { return };
+            Job::ApplyLut(path, split) => {
+                let Some(ph) = &self.photo else { return };
+                if self.selected.as_ref().is_none_or(|(p, _)| *p != path) {
+                    match Lut3d::load(&path) {
+                        Ok(l) => self.selected = Some((path, gpu.upload_lut(&l))),
+                        Err(_) => return,
+                    }
+                }
+                let lut = &self.selected.as_ref().expect("loaded above").1;
                 let rgba = gpu.apply_lut(ph, lut, split);
                 notify(Done::Compared { width: ph.width, height: ph.height, rgba });
             }
-            Job::Gallery(generation) => {
+            Job::Gallery(generation, paths) => {
                 let Some(th) = &self.thumb else { return };
-                for (index, lut) in self.luts.iter().enumerate() {
-                    let rgba = gpu.apply_lut(th, lut, 0.0);
+                for (index, path) in paths.iter().enumerate() {
+                    let Ok(lut) = Lut3d::load(path) else { continue };
+                    let rgba = gpu.apply_lut(th, &gpu.upload_lut(&lut), 0.0);
                     notify(Done::Thumb { generation, index, width: th.width, height: th.height, rgba });
                 }
             }
