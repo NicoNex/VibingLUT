@@ -42,7 +42,7 @@ impl Photo {
         if f == 1 {
             return self.clone();
         }
-        let (w, h) = (self.width / f, self.height / f);
+        let (w, h) = ((self.width / f).max(1), (self.height / f).max(1));
         let mut pixels = Vec::with_capacity((w * h) as usize);
         let norm = 1.0 / (f * f) as f32;
         for y in 0..h {
@@ -110,10 +110,11 @@ fn load_raw(path: &Path) -> Result<Photo, String> {
 // ponytail: approximates, does not replicate, the camera's Standard profile.
 // For a pixel-exact LUT match shoot RAW+JPEG and grade the JPEG.
 fn base_look(c: [f32; 3]) -> [f32; 3] {
-    const WHITE: f32 = 6.0;
-    let c = c.map(|v| v.max(0.0));
+    const EXPOSURE: f32 = 2.2; // Lumix RAWs sit ~1 EV under the camera JPEG
+    const WHITE: f32 = 6.0; // exposed scene value mapped to display white
+    let c = c.map(|v| v.max(0.0) * EXPOSURE);
     let m = c[0].max(c[1]).max(c[2]);
-    let k = if m > 0.0 { (1.0 + m / (WHITE * WHITE)) / (1.0 + m) * 2.2 } else { 0.0 };
+    let k = if m > 0.0 { (1.0 + m / (WHITE * WHITE)) / (1.0 + m) } else { 0.0 };
     c.map(|v| srgb_encode((v * k).min(1.0)))
 }
 

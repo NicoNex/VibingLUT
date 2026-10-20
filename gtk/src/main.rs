@@ -3,7 +3,7 @@
 mod widgets;
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use relm4::adw::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
@@ -23,7 +23,7 @@ type Field = fn(&mut Params) -> &mut f32;
 enum Msg {
     Open,
     OpenPath(PathBuf),
-    Loaded(PathBuf, Result<Photo, String>),
+    Loaded(u64, PathBuf, Result<Photo, String>),
     Set(Field, f64),
     Wheel(usize, f32, f32),
     WheelLuma(usize, f64),
@@ -37,7 +37,7 @@ enum Msg {
     ExportTo(usize, PathBuf),
     ChooseFolder,
     Folder(PathBuf),
-    GalleryLoaded(Vec<Lut3d>, Vec<String>),
+    GalleryLoaded(Vec<Arc<Lut3d>>, Vec<String>),
     SelectLut(usize),
     Gpu(Done),
 }
@@ -68,11 +68,15 @@ struct App {
     compare: bool,
     split: f32,
     path: Option<PathBuf>,
-    luts: Vec<Lut3d>,
+    luts: Vec<Arc<Lut3d>>,
     selected: Option<usize>,
     jobs: mpsc::Sender<Job>,
-    /// Set while restoring widget values, so their change signals don't re-render.
-    syncing: bool,
+    /// Last preview request; identical requests (e.g. echoes of programmatic
+    /// widget resets) are not re-rendered.
+    sent: Option<(Grade, f32)>,
+    /// Latest photo load / gallery pass; results from older ones are dropped.
+    load_gen: u64,
+    gallery_gen: u64,
     ui: Ui,
 }
 
@@ -81,15 +85,30 @@ impl App {
         if self.compare { self.split } else { 0.0 }
     }
 
-    fn render(&self) {
-        if self.path.is_some() && !self.syncing {
-            let _ = self.jobs.send(Job::Render(self.grade.clone(), self.split_value()));
+    fn send(&self, job: Job) {
+        if self.jobs.send(job).is_err() {
+            self.toast("GPU non disponibile");
+        }
+    }
+
+    fn render(&mut self) {
+        let req = Some((self.grade.clone(), self.split_value()));
+        if self.path.is_some() && self.sent != req {
+            self.send(Job::Render(self.grade.clone(), self.split_value()));
+            self.sent = req;
         }
     }
 
     fn render_compare(&self) {
         if let (Some(i), Some(_)) = (self.selected, &self.path) {
-            let _ = self.jobs.send(Job::ApplyLut(self.luts[i].clone(), self.split_value()));
+            self.send(Job::ApplyLut(self.luts[i].clone(), self.split_value()));
+        }
+    }
+
+    fn render_gallery(&mut self) {
+        if self.path.is_some() && !self.luts.is_empty() {
+            self.gallery_gen += 1;
+            self.send(Job::Gallery { generation: self.gallery_gen, luts: self.luts.clone() });
         }
     }
 
@@ -735,7 +754,9 @@ impl SimpleComponent for App {
             luts: Vec::new(),
             selected: None,
             jobs,
-            syncing: false,
+            sent: None,
+            load_gen: 0,
+            gallery_gen: 0,
             ui: Ui {
                 window: window.clone(),
                 toasts,
@@ -765,10 +786,9 @@ impl SimpleComponent for App {
     fn update(&mut self, msg: Msg, sender: ComponentSender<Self>) {
         match msg {
             Msg::Open => {
-                let mut pats: Vec<String> =
-                    ["jpg", "jpeg", "png", "tif", "tiff"].iter().map(|s| s.to_string()).collect();
-                pats.extend(RAW_EXTS.iter().map(|s| s.to_string()));
-                let pats: Vec<String> = pats.iter().flat_map(|p| [p.clone(), p.to_uppercase()]).collect();
+                // add_suffix matches case-insensitively.
+                let pats: Vec<String> =
+                    ["jpg", "jpeg", "png", "tif", "tiff"].iter().chain(RAW_EXTS).map(|s| s.to_string()).collect();
                 let dialog = gtk::FileDialog::builder()
                     .title("Apri foto")
                     .filters(&file_filters("Foto e RAW", &pats))
@@ -783,27 +803,28 @@ impl SimpleComponent for App {
             }
             Msg::OpenPath(path) => {
                 self.ui.grade_stack.set_visible_child_name("loading");
-                let s = sender.input_sender().clone();
+                self.load_gen += 1;
+                let (s, generation) = (sender.input_sender().clone(), self.load_gen);
                 std::thread::spawn(move || {
                     let r = Photo::load(&path);
-                    s.emit(Msg::Loaded(path, r));
+                    s.emit(Msg::Loaded(generation, path, r));
                 });
             }
-            Msg::Loaded(path, Ok(photo)) => {
+            Msg::Loaded(generation, ..) if generation != self.load_gen => {}
+            Msg::Loaded(_, path, Ok(photo)) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.ui.window.set_title(Some(&format!("{name} — VibingLUT")));
                 self.ui.info.set_label(&format!("{name} · {}×{} anteprima", photo.width, photo.height));
-                let _ = self.jobs.send(Job::SetPhoto(photo));
+                self.send(Job::SetPhoto(photo));
                 self.path = Some(path);
+                self.sent = None;
                 self.ui.export.set_sensitive(true);
                 self.ui.grade_stack.set_visible_child_name("image");
                 self.render();
-                if !self.luts.is_empty() {
-                    let _ = self.jobs.send(Job::Gallery(self.luts.clone()));
-                    self.render_compare();
-                }
+                self.render_gallery();
+                self.render_compare();
             }
-            Msg::Loaded(path, Err(e)) => {
+            Msg::Loaded(_, path, Err(e)) => {
                 self.ui.grade_stack.set_visible_child_name(if self.path.is_some() { "image" } else { "empty" });
                 self.toast(&format!("Impossibile aprire {}: {e}", path.display()));
             }
@@ -822,18 +843,13 @@ impl SimpleComponent for App {
             }
             Msg::Band(b) => {
                 self.band = b;
-                // Show this band's values without triggering renders.
-                self.syncing = true;
+                // The resulting Hue echoes carry unchanged values, so render() skips them.
                 let p = self.grade.params;
                 for (s, v) in self.ui.hue.iter().zip([p.hue_shift[b], p.hue_sat[b], p.hue_lum[b]]) {
                     s.adj.set_value(v as f64);
                 }
-                self.syncing = false;
             }
             Msg::Hue(k, v) => {
-                if self.syncing {
-                    return;
-                }
                 let p = &mut self.grade.params;
                 let band = match k {
                     0 => &mut p.hue_shift,
@@ -848,14 +864,12 @@ impl SimpleComponent for App {
                 self.render();
             }
             Msg::ResetAll => {
-                self.syncing = true;
                 self.ui.sliders.iter().chain(&self.ui.hue).for_each(Slider::reset);
                 for (w, l) in &self.ui.wheels {
                     w.set(0.0, 0.0);
                     l.reset();
                 }
                 self.ui.curves.reset_all();
-                self.syncing = false;
                 self.grade = Grade::default();
                 self.render();
             }
@@ -889,7 +903,7 @@ impl SimpleComponent for App {
             }
             Msg::ExportTo(size, path) => {
                 let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                let _ = self.jobs.send(Job::Export { grade: self.grade.clone(), size, title, path });
+                self.send(Job::Export { grade: self.grade.clone(), size, title, path });
             }
             Msg::ChooseFolder => {
                 let dialog = gtk::FileDialog::builder().title("Cartella LUT").modal(true).build();
@@ -938,9 +952,7 @@ impl SimpleComponent for App {
                 self.luts = luts;
                 self.selected = None;
                 self.ui.compare_stack.set_visible_child_name("empty");
-                if self.path.is_some() {
-                    let _ = self.jobs.send(Job::Gallery(self.luts.clone()));
-                }
+                self.render_gallery();
                 if let Some(c) = self.ui.flow.child_at_index(0) {
                     self.ui.flow.select_child(&c);
                 }
@@ -977,7 +989,10 @@ impl App {
                     v.set_paintable(Some(&texture(VEC_SIZE as u32, VEC_SIZE as u32, vectorscope)));
                 }
             }
-            Done::Thumb { index, width, height, rgba } => {
+            Done::Thumb { generation, index, width, height, rgba } => {
+                if generation != self.gallery_gen {
+                    return;
+                }
                 if let Some(p) = self.ui.thumbs.get(index) {
                     p.set_paintable(Some(&texture(width, height, rgba)));
                 }
@@ -999,7 +1014,7 @@ fn wheel_mut(p: &mut Params, i: usize) -> &mut [f32; 4] {
     }
 }
 
-fn load_folder(dir: &Path) -> (Vec<Lut3d>, Vec<String>) {
+fn load_folder(dir: &Path) -> (Vec<Arc<Lut3d>>, Vec<String>) {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok().map(|e| e.path()))
@@ -1011,7 +1026,7 @@ fn load_folder(dir: &Path) -> (Vec<Lut3d>, Vec<String>) {
     let (mut luts, mut errors) = (Vec::new(), Vec::new());
     for p in paths {
         match Lut3d::load(&p) {
-            Ok(l) => luts.push(l),
+            Ok(l) => luts.push(Arc::new(l)),
             Err(e) => errors.push(format!("{}: {e}", p.file_name().unwrap_or_default().to_string_lossy())),
         }
     }

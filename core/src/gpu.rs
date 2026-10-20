@@ -1,7 +1,8 @@
 //! GPU engine (wgpu → Vulkan / Metal / DX12, native only) and its worker thread.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use wgpu::util::DeviceExt;
 
@@ -23,6 +24,11 @@ pub struct GpuPhoto {
     buf: wgpu::Buffer,
     width: u32,
     height: u32,
+}
+
+pub struct GpuLut {
+    buf: wgpu::Buffer,
+    size: u32,
 }
 
 const WORKGROUP: u32 = 256;
@@ -142,13 +148,16 @@ impl Gpu {
         self.run(&self.preview, &[(0, &params), (1, &curves), (2, &photo.buf)], 3, n, n as u64 * 4)
     }
 
-    /// Photo seen through an external LUT (tetrahedral), as RGBA8.
-    pub fn apply_lut(&self, photo: &GpuPhoto, lut: &Lut3d, split: f32) -> Vec<u8> {
-        let params = self.params(Params::default(), photo.width, photo.height, lut.size as u32, split);
+    pub fn upload_lut(&self, lut: &Lut3d) -> GpuLut {
         let data: Vec<[f32; 4]> = lut.data.iter().map(|&[r, g, b]| [r, g, b, 1.0]).collect();
-        let lut_buf = self.storage(bytemuck::cast_slice(&data));
+        GpuLut { buf: self.storage(bytemuck::cast_slice(&data)), size: lut.size as u32 }
+    }
+
+    /// Photo seen through an external LUT (tetrahedral), as RGBA8.
+    pub fn apply_lut(&self, photo: &GpuPhoto, lut: &GpuLut, split: f32) -> Vec<u8> {
+        let params = self.params(Params::default(), photo.width, photo.height, lut.size, split);
         let n = photo.width * photo.height;
-        self.run(&self.apply, &[(0, &params), (2, &photo.buf), (5, &lut_buf)], 3, n, n as u64 * 4)
+        self.run(&self.apply, &[(0, &params), (2, &photo.buf), (5, &lut.buf)], 3, n, n as u64 * 4)
     }
 
     /// Evaluates the grade exactly on every lattice point of an N³ cube.
@@ -173,16 +182,34 @@ pub enum View {
 pub enum Job {
     SetPhoto(Photo),
     Render(Grade, f32),
-    ApplyLut(Lut3d, f32),
-    Gallery(Vec<Lut3d>),
-    Export { grade: Grade, size: usize, title: String, path: PathBuf },
+    ApplyLut(Arc<Lut3d>, f32),
+    /// Thumbnails of every LUT; `generation` lets the UI drop stale results.
+    Gallery {
+        generation: u64,
+        luts: Vec<Arc<Lut3d>>,
+    },
+    Export {
+        grade: Grade,
+        size: usize,
+        title: String,
+        path: PathBuf,
+    },
+}
+
+#[derive(PartialEq)]
+enum Slot {
+    Grade,
+    Compare,
+    Gallery,
 }
 
 impl Job {
-    fn preview_view(&self) -> Option<View> {
+    /// Jobs whose newer instance makes older ones pointless.
+    fn slot(&self) -> Option<Slot> {
         match self {
-            Job::Render(..) => Some(View::Grade),
-            Job::ApplyLut(..) => Some(View::Compare),
+            Job::Render(..) => Some(Slot::Grade),
+            Job::ApplyLut(..) => Some(Slot::Compare),
+            Job::Gallery { .. } => Some(Slot::Gallery),
             _ => None,
         }
     }
@@ -193,12 +220,56 @@ pub enum Done {
     Ready(String),
     Failed(String),
     Frame { view: View, width: u32, height: u32, rgba: Vec<u8>, scopes: Option<Scopes> },
-    Thumb { index: usize, width: u32, height: u32, rgba: Vec<u8> },
+    Thumb { generation: u64, index: usize, width: u32, height: u32, rgba: Vec<u8> },
     Exported(Result<PathBuf, String>),
 }
 
-/// Spawns the render thread. Preview jobs are coalesced to the latest one
-/// per view so slider drags never queue up stale frames.
+#[derive(Default)]
+struct Worker {
+    photo: Option<GpuPhoto>,
+    thumb: Option<GpuPhoto>,
+    /// Last applied LUT stays on the GPU so split drags don't re-upload it.
+    lut: Option<(Arc<Lut3d>, GpuLut)>,
+}
+
+impl Worker {
+    fn handle(&mut self, gpu: &Gpu, job: Job, notify: &impl Fn(Done)) {
+        match job {
+            Job::SetPhoto(p) => {
+                self.thumb = Some(gpu.upload(&p.downscaled(THUMB_MAX)));
+                self.photo = Some(gpu.upload(&p));
+            }
+            Job::Render(grade, split) => {
+                let Some(ph) = &self.photo else { return };
+                let rgba = gpu.render(ph, &grade, split);
+                let scopes = Some(Scopes::compute(&rgba, ph.width, ph.height, split));
+                notify(Done::Frame { view: View::Grade, width: ph.width, height: ph.height, rgba, scopes });
+            }
+            Job::ApplyLut(lut, split) => {
+                let Some(ph) = &self.photo else { return };
+                if !self.lut.as_ref().is_some_and(|(l, _)| Arc::ptr_eq(l, &lut)) {
+                    self.lut = Some((lut.clone(), gpu.upload_lut(&lut)));
+                }
+                let rgba = gpu.apply_lut(ph, &self.lut.as_ref().expect("uploaded above").1, split);
+                notify(Done::Frame { view: View::Compare, width: ph.width, height: ph.height, rgba, scopes: None });
+            }
+            Job::Gallery { generation, luts } => {
+                let Some(th) = &self.thumb else { return };
+                for (index, lut) in luts.iter().enumerate() {
+                    let rgba = gpu.apply_lut(th, &gpu.upload_lut(lut), 0.0);
+                    notify(Done::Thumb { generation, index, width: th.width, height: th.height, rgba });
+                }
+            }
+            Job::Export { grade, size, title, path } => {
+                let cube = gpu.bake(&grade, size, title).to_cube();
+                notify(Done::Exported(std::fs::write(&path, cube).map(|_| path).map_err(|e| e.to_string())));
+            }
+        }
+    }
+}
+
+/// Spawns the render thread. Previews and gallery passes are coalesced to
+/// the latest request so slider drags never queue up stale frames.
 pub fn spawn(notify: impl Fn(Done) + Send + 'static) -> mpsc::Sender<Job> {
     let (tx, rx) = mpsc::channel::<Job>();
     std::thread::Builder::new()
@@ -209,50 +280,22 @@ pub fn spawn(notify: impl Fn(Done) + Send + 'static) -> mpsc::Sender<Job> {
                 Err(e) => return notify(Done::Failed(e)),
             };
             notify(Done::Ready(gpu.name.clone()));
-            let (mut photo, mut thumb): (Option<GpuPhoto>, Option<GpuPhoto>) = (None, None);
+            let mut worker = Worker::default();
             while let Ok(first) = rx.recv() {
-                let jobs: Vec<Job> = std::iter::once(first).chain(rx.try_iter()).collect();
-                let last = |v| jobs.iter().rposition(|j| j.preview_view() == Some(v));
-                let keep = [last(View::Grade), last(View::Compare)];
-                for (i, job) in jobs.into_iter().enumerate() {
-                    if job.preview_view().is_some() && !keep.contains(&Some(i)) {
-                        continue;
-                    }
-                    match job {
-                        Job::SetPhoto(p) => {
-                            thumb = Some(gpu.upload(&p.downscaled(THUMB_MAX)));
-                            photo = Some(gpu.upload(&p));
-                        }
-                        Job::Render(grade, split) => {
-                            let Some(ph) = &photo else { continue };
-                            let rgba = gpu.render(ph, &grade, split);
-                            let scopes = Some(Scopes::compute(&rgba, ph.width, ph.height));
-                            notify(Done::Frame { view: View::Grade, width: ph.width, height: ph.height, rgba, scopes });
-                        }
-                        Job::ApplyLut(lut, split) => {
-                            let Some(ph) = &photo else { continue };
-                            let rgba = gpu.apply_lut(ph, &lut, split);
-                            notify(Done::Frame {
-                                view: View::Compare,
-                                width: ph.width,
-                                height: ph.height,
-                                rgba,
-                                scopes: None,
-                            });
-                        }
-                        Job::Gallery(luts) => {
-                            let Some(th) = &thumb else { continue };
-                            for (index, lut) in luts.iter().enumerate() {
-                                let rgba = gpu.apply_lut(th, lut, 0.0);
-                                notify(Done::Thumb { index, width: th.width, height: th.height, rgba });
-                            }
-                        }
-                        Job::Export { grade, size, title, path } => {
-                            let cube = gpu.bake(&grade, size, title).to_cube();
-                            notify(Done::Exported(
-                                std::fs::write(&path, cube).map(|_| path).map_err(|e| e.to_string()),
-                            ));
-                        }
+                let mut jobs: Vec<Job> = std::iter::once(first).chain(rx.try_iter()).collect();
+                let superseded = |i: usize, jobs: &[Job]| {
+                    jobs[i].slot().is_some_and(|s| jobs[i + 1..].iter().any(|j| j.slot().as_ref() == Some(&s)))
+                };
+                let keep: Vec<bool> = (0..jobs.len()).map(|i| !superseded(i, &jobs)).collect();
+                // Gallery passes are slow; run them after this batch's previews.
+                let mut order: Vec<usize> = (0..jobs.len()).filter(|&i| keep[i]).collect();
+                order.sort_by_key(|&i| jobs[i].slot() == Some(Slot::Gallery));
+                let mut taken: Vec<Option<Job>> = jobs.drain(..).map(Some).collect();
+                for i in order {
+                    let job = taken[i].take().expect("each job runs once");
+                    // A device loss or validation error panics inside wgpu: report it instead of dying silently.
+                    if catch_unwind(AssertUnwindSafe(|| worker.handle(&gpu, job, &notify))).is_err() {
+                        return notify(Done::Failed("errore della GPU, riavvia l'applicazione".into()));
                     }
                 }
             }
@@ -296,7 +339,7 @@ mod tests {
         };
         let gp = gpu.upload(&photo);
         let direct = gpu.render(&gp, &grade, 0.0);
-        let via_lut = gpu.apply_lut(&gp, &gpu.bake(&grade, 65, "t".into()), 0.0);
+        let via_lut = gpu.apply_lut(&gp, &gpu.upload_lut(&gpu.bake(&grade, 65, "t".into())), 0.0);
         let diff: Vec<u8> = direct.iter().zip(&via_lut).map(|(a, b)| a.abs_diff(*b)).collect();
         let worst = *diff.iter().max().unwrap();
         let mean = diff.iter().map(|&d| d as f32).sum::<f32>() / diff.len() as f32;

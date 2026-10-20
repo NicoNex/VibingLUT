@@ -89,6 +89,7 @@ const CHANNEL_RGB: [(f64, f64, f64); 4] =
     [(0.92, 0.92, 0.92), (0.94, 0.33, 0.31), (0.36, 0.82, 0.42), (0.36, 0.56, 0.98)];
 const HIT_RADIUS: f64 = 12.0;
 const PAD: f64 = 8.0;
+const MIN_GAP: f64 = 0.01;
 
 struct CurveState {
     curves: [Curve; 4],
@@ -123,7 +124,7 @@ impl CurveEditor {
         let on_change = Rc::new(on_change);
         let drag = gtk::GestureDrag::new();
         {
-            let (s, a) = (state.clone(), area.clone());
+            let (s, a, f) = (state.clone(), area.clone(), on_change.clone());
             drag.connect_drag_begin(move |_, x, y| {
                 let mut st = s.borrow_mut();
                 let (w, h) = (a.width() as f64 - 2.0 * PAD, a.height() as f64 - 2.0 * PAD);
@@ -132,13 +133,25 @@ impl CurveEditor {
                     let (sx, sy) = (PAD + px as f64 * w, PAD + (1.0 - py as f64) * h);
                     (sx - x).hypot(sy - y) < HIT_RADIUS
                 });
-                let idx = hit.unwrap_or_else(|| {
-                    let (cx, cy) = to_curve(&a, x, y);
-                    let pts = &mut st.curves[ch];
-                    let i = pts.iter().position(|p| p.0 as f64 > cx).unwrap_or(pts.len() - 1).max(1);
-                    pts.insert(i, (cx as f32, cy as f32));
-                    i
-                });
+                let idx = match hit {
+                    Some(i) => i,
+                    None => {
+                        let (cx, cy) = to_curve(&a, x, y);
+                        let pts = &mut st.curves[ch];
+                        let i = pts.iter().position(|p| p.0 as f64 > cx).unwrap_or(pts.len() - 1).max(1);
+                        // Keep a minimum gap so neighbours never collapse onto one x.
+                        if cx - (pts[i - 1].0 as f64) < MIN_GAP || (pts[i].0 as f64) - cx < MIN_GAP {
+                            return;
+                        }
+                        pts.insert(i, (cx as f32, cy as f32));
+                        let curve = pts.clone();
+                        drop(st);
+                        a.queue_draw();
+                        f(ch, curve);
+                        st = s.borrow_mut();
+                        i
+                    }
+                };
                 let p = st.curves[ch][idx];
                 st.drag = Some((idx, p.0 as f64, p.1 as f64));
             });
@@ -157,7 +170,8 @@ impl CurveEditor {
                     let x = if i == 0 || i == last {
                         pts[i].0 as f64
                     } else {
-                        (x0 + dx / w).clamp(pts[i - 1].0 as f64 + 0.01, pts[i + 1].0 as f64 - 0.01)
+                        let (lo, hi) = (pts[i - 1].0 as f64 + MIN_GAP, pts[i + 1].0 as f64 - MIN_GAP);
+                        if lo < hi { (x0 + dx / w).clamp(lo, hi) } else { (lo + hi) / 2.0 }
                     };
                     pts[i] = (x as f32, (y0 - dy / h).clamp(0.0, 1.0) as f32);
                     (ch, pts.clone())

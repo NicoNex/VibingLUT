@@ -17,8 +17,11 @@ fn glow(count: u32, gain: f32) -> f32 {
 }
 
 impl Scopes {
-    pub fn compute(rgba: &[u8], width: u32, height: u32) -> Self {
+    /// `split` > 0 marks the left (ungraded) part of a before/after frame,
+    /// which is excluded so scopes always describe the grade.
+    pub fn compute(rgba: &[u8], width: u32, height: u32, split: f32) -> Self {
         let n = (width * height) as usize;
+        let skip_cols = if split > 0.0 { (split * width as f32) as usize + 2 } else { 0 };
         // ponytail: fixed-stride subsampling, ~150k samples is plenty for scopes.
         let step = (n / 150_000).max(1);
 
@@ -27,8 +30,12 @@ impl Scopes {
         let mut vec = vec![[0u32; 4]; VEC_SIZE * VEC_SIZE];
         let mut samples = 0u32;
         for i in (0..n).step_by(step) {
+            let x = i % width as usize;
+            if x < skip_cols {
+                continue;
+            }
             let px = &rgba[i * 4..i * 4 + 3];
-            let col = (i % width as usize) * HIST_W / width as usize;
+            let col = x * HIST_W / width as usize;
             for c in 0..3 {
                 hist[c][px[c] as usize] += 1;
                 let row = HIST_H - 1 - px[c] as usize * (HIST_H - 1) / 255;
