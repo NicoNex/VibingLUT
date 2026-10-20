@@ -7,4 +7,4 @@ license.workspace = true
 
 [dependencies]
 vibinglut-core = { path = "../core" }
-relm4 = { version = "0.11", features = ["libadwaita", "gnome_48"] }
+relm4 = { version = "0.11", features = ["libadwaita", "gnome_50"] }

@@ -23,10 +23,13 @@ pub struct Params {
     pub blacks: f32,
     pub saturation: f32,
     pub vibrance: f32,
+    pub sat_shadows: f32,
+    pub sat_highlights: f32,
     /// Colour wheels: [chroma x, chroma y, luma, unused].
     pub lift: [f32; 4],
     pub gamma: [f32; 4],
     pub gain: [f32; 4],
+    pub offset: [f32; 4],
     /// OKLCh hue bands: red, orange, yellow, green, aqua, blue, purple, magenta.
     pub hue_shift: [f32; 8],
     pub hue_sat: [f32; 8],
@@ -120,8 +123,8 @@ mod tests {
 
     #[test]
     fn params_layout_matches_wgsl() {
-        // 10 scalars + 3×4 wheels + 3×8 hue + split,width,height,lut_size
-        assert_eq!(std::mem::size_of::<Params>(), (10 + 12 + 24 + 4) * 4);
+        // 12 scalars + 4×4 wheels + 3×8 hue + split,width,height,lut_size
+        assert_eq!(std::mem::size_of::<Params>(), (12 + 16 + 24 + 4) * 4);
     }
 
     #[test]

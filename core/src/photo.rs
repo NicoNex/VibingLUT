@@ -113,7 +113,7 @@ fn base_look(c: [f32; 3]) -> [f32; 3] {
     const WHITE: f32 = 6.0;
     let c = c.map(|v| v.max(0.0));
     let m = c[0].max(c[1]).max(c[2]);
-    let k = if m > 0.0 { (1.0 + m / (WHITE * WHITE)) / (1.0 + m) * 1.6 } else { 0.0 };
+    let k = if m > 0.0 { (1.0 + m / (WHITE * WHITE)) / (1.0 + m) * 2.2 } else { 0.0 };
     c.map(|v| srgb_encode((v * k).min(1.0)))
 }
 

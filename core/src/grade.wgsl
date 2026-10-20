@@ -5,8 +5,8 @@
 struct Params {
     temperature: f32, tint: f32, exposure: f32, contrast: f32,
     highlights: f32, shadows: f32, whites: f32, blacks: f32,
-    saturation: f32, vibrance: f32,
-    lift: array<f32, 4>, gamma: array<f32, 4>, gain: array<f32, 4>,
+    saturation: f32, vibrance: f32, sat_shadows: f32, sat_highlights: f32,
+    lift: array<f32, 4>, gamma: array<f32, 4>, gain: array<f32, 4>, offset: array<f32, 4>,
     hue_shift: array<f32, 8>, hue_sat: array<f32, 8>, hue_lum: array<f32, 8>,
     split: f32, width: u32, height: u32, lut_size: u32,
 }
@@ -35,16 +35,16 @@ fn lin_to_srgb(c: vec3<f32>) -> vec3<f32> {
 }
 
 // ---------------------------------------------------------- white balance
-// Bradford chromatic adaptation from a CIE daylight-locus white to D65.
+// CAT16 (CIECAM16) von Kries adaptation from a CIE daylight-locus white to D65.
 
-const RGB_TO_LMS = mat3x3<f32>(  // Bradford · sRGB→XYZ, column-major
-    vec3(0.42266, 0.05562, 0.02135),
-    vec3(0.49138, 0.96160, 0.08765),
-    vec3(0.02739, 0.02318, 0.98070));
-const XYZ_TO_LMS = mat3x3<f32>(
-    vec3(0.8951, -0.7502, 0.0389),
-    vec3(0.2664, 1.7135, -0.0685),
-    vec3(-0.1614, 0.0367, 1.0296));
+const RGB_TO_LMS = mat3x3<f32>(  // M16 · sRGB→XYZ(D65), column-major
+    vec3(0.302745, 0.153783, 0.027977),
+    vec3(0.602344, 0.777333, 0.147874),
+    vec3(0.070447, 0.085366, 0.909137));
+const XYZ_TO_LMS = mat3x3<f32>(  // M16, column-major
+    vec3(0.401288, -0.250268, -0.002079),
+    vec3(0.650173, 1.204414, 0.048952),
+    vec3(-0.051461, 0.045854, 0.953127));
 
 fn inverse3(m: mat3x3<f32>) -> mat3x3<f32> {
     let a = cross(m[1], m[2]);
@@ -137,7 +137,7 @@ fn band(v: array<f32, 8>, h: f32) -> f32 {
 fn color(c: vec3<f32>) -> vec3<f32> {
     let lab = lin_to_oklab(c);
     var chroma = length(lab.yz);
-    if chroma < 1e-7 && p.saturation == 0.0 { return c; }
+    if chroma < 1e-7 { return c; }
     var hue = atan2(lab.z, lab.y);
     if hue < 0.0 { hue += TAU; }
     let w = smoothstep(0.0, 0.06, chroma); // leave neutrals alone
@@ -146,6 +146,9 @@ fn color(c: vec3<f32>) -> vec3<f32> {
     chroma *= max(0.0, 1.0 + band(p.hue_sat, hue) * 0.01 * w);
     chroma *= max(0.0, 1.0 + p.saturation * 0.01);
     chroma *= max(0.0, 1.0 + p.vibrance * 0.01 * (1.0 - smoothstep(0.0, 0.2, chroma)));
+    // Luma vs Sat: saturation by tonal range (OKLab L is perceptual lightness).
+    let lv = lab.x;
+    chroma *= max(0.0, 1.0 + 0.01 * (p.sat_shadows * (1.0 - smoothstep(0.15, 0.55, lv)) + p.sat_highlights * smoothstep(0.55, 0.95, lv)));
     return oklab_to_lin(vec3(l, chroma * cos(hue), chroma * sin(hue)));
 }
 
@@ -191,7 +194,8 @@ fn grade(input: vec3<f32>) -> vec3<f32> {
     let wp = 1.0 - p.whites * 0.0025;
     d = (d - bp) / (wp - bp);
 
-    // Lift / gamma / gain (ASC-CDL-like primaries).
+    // Offset / lift / gamma / gain primaries (Resolve-style wheels).
+    d += wheel(p.offset) * 0.2 + p.offset[2] * 0.002;
     let lift = wheel(p.lift) * 0.25 + p.lift[2] * 0.0025;
     let gain = 1.0 + wheel(p.gain) * 0.5 + p.gain[2] * 0.005;
     let gamma = max(1.0 + wheel(p.gamma) * 0.5 + p.gamma[2] * 0.005, vec3(0.05));

@@ -63,9 +63,8 @@ impl Lut3d {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let mut lut = Self::parse(&text)?;
-        if lut.title.is_empty() {
-            lut.title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        }
+        // TITLE lines are wildly inconsistent in the wild; the file name is what users recognise.
+        lut.title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(lut.title);
         Ok(lut)
     }
 }

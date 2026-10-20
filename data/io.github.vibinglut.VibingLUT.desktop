@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=VibingLUT
+GenericName=LUT Creator
+Comment=Color grade photos and export 3D LUTs (.cube)
+Comment[it]=Color grading da foto ed esportazione di LUT 3D (.cube)
+Exec=vibinglut %f
+Icon=io.github.vibinglut.VibingLUT
+Terminal=false
+Categories=Graphics;Photography;GTK;GNOME;
+Keywords=LUT;cube;color;grading;raw;lumix;
+MimeType=image/jpeg;image/png;image/tiff;image/x-panasonic-rw2;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-sony-arw;image/x-fuji-raf;image/x-olympus-orf;image/x-adobe-dng;
+StartupNotify=true
