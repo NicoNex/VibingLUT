@@ -82,7 +82,42 @@ impl Default for Grade {
     }
 }
 
+/// Groups of grade controls that can be switched off together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    WhiteBalance,
+    Tone,
+    Color,
+    Wheels,
+    Selective,
+    Curves,
+}
+
+impl Stage {
+    pub const ALL: [Stage; 6] =
+        [Stage::WhiteBalance, Stage::Tone, Stage::Color, Stage::Wheels, Stage::Selective, Stage::Curves];
+}
+
 impl Grade {
+    /// Resets `stage` to neutral, leaving the rest of the grade (and the input) as is.
+    pub fn bypass(&mut self, stage: Stage) {
+        let (p, d, curves) = (&mut self.params, Params::default(), &mut self.curves);
+        match stage {
+            Stage::WhiteBalance => (p.temperature, p.tint) = (d.temperature, d.tint),
+            Stage::Tone => {
+                (p.exposure, p.contrast, p.highlights) = (d.exposure, d.contrast, d.highlights);
+                (p.shadows, p.whites, p.blacks) = (d.shadows, d.whites, d.blacks);
+            }
+            Stage::Color => {
+                (p.saturation, p.vibrance) = (d.saturation, d.vibrance);
+                (p.sat_shadows, p.sat_highlights) = (d.sat_shadows, d.sat_highlights);
+            }
+            Stage::Wheels => (p.lift, p.gamma, p.gain, p.offset) = (d.lift, d.gamma, d.gain, d.offset),
+            Stage::Selective => (p.hue_shift, p.hue_sat, p.hue_lum) = (d.hue_shift, d.hue_sat, d.hue_lum),
+            Stage::Curves => *curves = Grade::default().curves,
+        }
+    }
+
     /// Curves packed as 4 × CURVE_RES samples for the GPU.
     pub fn curve_samples(&self) -> Vec<f32> {
         let mut out = vec![0.0; 4 * CURVE_RES];
@@ -140,6 +175,22 @@ pub fn sample_curve(pts: &[(f32, f32)], out: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
+    /// Bypassing every stage leaves only the input decoding: a neutral grade.
+    #[test]
+    fn bypassing_all_stages_is_neutral() {
+        use super::*;
+        let mut g = Grade::default();
+        let p = &mut g.params;
+        (p.temperature, p.exposure, p.saturation, p.sat_highlights) = (10.0, 0.5, 20.0, -5.0);
+        (p.whites, p.lift, p.hue_lum[3]) = (7.0, [0.1, 0.0, 0.2, 0.0], 30.0);
+        g.curves[2] = vec![(0.0, 0.1), (1.0, 0.9)];
+        g.params.set_input(Profile::VLog);
+        let mut want = Grade::default();
+        want.params.set_input(Profile::VLog);
+        Stage::ALL.into_iter().for_each(|s| g.bypass(s));
+        assert_eq!(g, want);
+    }
+
     use super::*;
 
     #[test]

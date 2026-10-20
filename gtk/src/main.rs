@@ -21,7 +21,7 @@ use relm4::gtk::{gdk, gio, glib};
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk};
 use vibinglut_core::chart::test_chart;
 use vibinglut_core::gpu::{self, Done, Job};
-use vibinglut_core::grade::{BAND_HUE_RANGE, BAND_HUES, Curve, Grade, Params};
+use vibinglut_core::grade::{BAND_HUE_RANGE, BAND_HUES, Curve, Grade, Params, Stage};
 use vibinglut_core::lab::{Blend, Layer, Source, Stack, oklch_to_srgb};
 use vibinglut_core::lut::{Format, Lut3d, LutEntry, MAX_LIBRARY};
 use vibinglut_core::photo::{Decoded, Photo, RASTER_EXTS, RAW_EXTS};
@@ -72,6 +72,8 @@ enum Msg {
     GalleryLoaded(Vec<LutEntry>, Vec<String>),
     Group(u32),
     Search(String),
+    /// A sidebar section switched off/on (`None` = the LUTs after the grade).
+    Bypass(Option<Stage>, bool),
     Preferences,
     Page(Page),
     LayerAdd(Layers, LabAdd),
@@ -130,6 +132,9 @@ struct App {
     lab_layers: Vec<LabLayer>,
     /// LUTs applied after the grade on the Grade page, baked into its export.
     looks: Vec<LabLayer>,
+    /// Sections switched off with their eye toggle; they are left out of preview and export.
+    bypassed: Vec<Stage>,
+    looks_off: bool,
     lab_input: Profile,
     lab_blend: Blend,
     profile: Profile,
@@ -199,10 +204,17 @@ impl App {
         self.render_gallery();
     }
 
+    /// The grade as previewed and exported: switched-off sections are neutral.
+    fn graded(&self) -> Grade {
+        let mut g = self.grade.clone();
+        self.bypassed.iter().for_each(|&s| g.bypass(s));
+        g
+    }
+
     fn render(&mut self) {
-        let req = Some((self.grade.clone(), self.split_value()));
+        let req = Some((self.graded(), self.split_value()));
         if self.has_source() && self.sent != req {
-            self.send(Job::Render(self.grade.clone(), self.split_value()));
+            self.send(Job::Render(self.graded(), self.split_value()));
             self.sent = req;
         }
     }
@@ -247,7 +259,7 @@ impl App {
             .map(|l| {
                 let (source, input) = match &l.kind {
                     LabKind::Lut(lut) => (Source::Lut(lut.clone()), l.input),
-                    LabKind::Grade => (Source::Grade(Box::new(self.grade.clone())), self.source_profile()),
+                    LabKind::Grade => (Source::Grade(Box::new(self.graded())), self.source_profile()),
                     LabKind::Convert(p) => (Source::Convert(*p), *p),
                 };
                 Layer { source, intensity: l.intensity, input }
@@ -327,6 +339,9 @@ impl App {
     }
 
     fn look_layers(&self) -> Vec<Layer> {
+        if self.looks_off {
+            return Vec::new();
+        }
         self.looks
             .iter()
             .filter_map(|l| match &l.kind {
@@ -356,7 +371,40 @@ fn texture(width: u32, height: u32, rgba: Vec<u8>) -> gdk::MemoryTexture {
 }
 
 /// Card with a collapsible header, like the sections of a grading panel.
+/// Collapsible card.
 fn section(title: &str, child: &impl IsA<gtk::Widget>) -> gtk::Box {
+    section_with(title, child, None)
+}
+
+/// Section with an eye toggle that switches it off (`which` = None: the LUTs after the grade).
+fn bypassable(
+    title: &str,
+    child: &impl IsA<gtk::Widget>,
+    which: Option<Stage>,
+    sender: &ComponentSender<App>,
+) -> gtk::Box {
+    let eye = gtk::ToggleButton::builder()
+        .icon_name("view-reveal-symbolic")
+        .tooltip_text(gettext("Disable section"))
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "circular"])
+        .build();
+    let (snd, content) = (sender.clone(), child.clone().upcast::<gtk::Widget>());
+    eye.connect_toggled(move |b| {
+        let off = b.is_active();
+        b.set_icon_name(if off { "view-conceal-symbolic" } else { "view-reveal-symbolic" });
+        b.set_tooltip_text(Some(&if off { gettext("Enable section") } else { gettext("Disable section") }));
+        if off {
+            content.add_css_class("bypassed")
+        } else {
+            content.remove_css_class("bypassed")
+        }
+        snd.input(Msg::Bypass(which, off));
+    });
+    section_with(title, child, Some(&eye))
+}
+
+fn section_with(title: &str, child: &impl IsA<gtk::Widget>, eye: Option<&gtk::ToggleButton>) -> gtk::Box {
     let arrow = gtk::Image::from_icon_name("pan-down-symbolic");
     let head = gtk::Box::builder().spacing(6).build();
     head.append(&gtk::Label::builder().label(title).css_classes(["heading"]).xalign(0.0).hexpand(true).build());
@@ -368,14 +416,27 @@ fn section(title: &str, child: &impl IsA<gtk::Widget>) -> gtk::Box {
         .reveal_child(true)
         .transition_type(gtk::RevealerTransitionType::SlideDown)
         .build();
-    let r = revealer.clone();
+    let card = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["card", "section"]).build();
+    let (r, c) = (revealer.clone(), card.clone());
     button.connect_clicked(move |_| {
         let open = !r.reveals_child();
         r.set_reveal_child(open);
+        // Symmetric padding once the body is gone, so the header sits centred.
+        if open {
+            c.remove_css_class("collapsed")
+        } else {
+            c.add_css_class("collapsed")
+        }
         arrow.set_icon_name(Some(if open { "pan-down-symbolic" } else { "pan-end-symbolic" }));
     });
-    let card = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["card", "section"]).build();
-    card.append(&button);
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    button.set_hexpand(true);
+    top.append(&button);
+    if let Some(eye) = eye {
+        eye.set_margin_end(6);
+        top.append(eye);
+    }
+    card.append(&top);
     card.append(&revealer);
     card
 }
@@ -433,10 +494,10 @@ const CSS: &str = r#"
 .canvas.bg-white { background-color: #fff; }
 .sidebar-pane { background-color: var(--sidebar-bg-color); }
 .section { padding: 4px 8px 10px 8px; }
+.section.collapsed { padding-bottom: 4px; }
 .section-header { padding: 6px 6px; margin-bottom: 2px; border-radius: 8px; }
 .slider-row { margin: 2px 4px 0 4px; }
-.slider-label { font-size: 0.92em; }
-.slider-value { font-size: 0.9em; opacity: 0.8; }
+.slider-value { opacity: 0.8; }
 .slider-reset { min-width: 24px; min-height: 24px; padding: 0; }
 scale.track-temp trough { background-image: linear-gradient(to right, #4f86e8, #e8e8e8, #f2b84b); }
 scale.track-tint trough { background-image: linear-gradient(to right, #4cbf5a, #e8e8e8, #d85bd0); }
@@ -444,6 +505,7 @@ scale.track-temp trough highlight, scale.track-tint trough highlight { backgroun
 .scope { background-color: rgba(0,0,0,0.55); border-radius: 8px; }
 .band { min-width: 22px; min-height: 22px; padding: 0; border-radius: 99px; }
 .band:checked { box-shadow: 0 0 0 2px var(--accent-color); }
+.bypassed { opacity: 0.45; }
 flowboxchild { padding: 0; border-radius: 12px; }
 flowboxchild:selected { background: none; }
 .thumb-card { padding: 6px; border-radius: 12px; }
@@ -573,7 +635,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     let wb = vbox(4);
     add(&wb, &gettext("Temperature"), -100.0, 100.0, 0, Some("track-temp"), |p| &mut p.temperature);
     add(&wb, &gettext("Tint"), -100.0, 100.0, 0, Some("track-tint"), |p| &mut p.tint);
-    panel.append(&section(&gettext("White balance"), &wb));
+    panel.append(&bypassable(&gettext("White balance"), &wb, Some(Stage::WhiteBalance), sender));
 
     let tone = vbox(4);
     add(&tone, &gettext("Exposure"), -3.0, 3.0, 2, None, |p| &mut p.exposure);
@@ -582,14 +644,14 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     add(&tone, &gettext("Shadows"), -100.0, 100.0, 0, None, |p| &mut p.shadows);
     add(&tone, &gettext("Whites"), -100.0, 100.0, 0, None, |p| &mut p.whites);
     add(&tone, &gettext("Blacks"), -100.0, 100.0, 0, None, |p| &mut p.blacks);
-    panel.append(&section(&gettext("Tone"), &tone));
+    panel.append(&bypassable(&gettext("Tone"), &tone, Some(Stage::Tone), sender));
 
     let color = vbox(4);
     add(&color, &gettext("Saturation"), -100.0, 100.0, 0, None, |p| &mut p.saturation);
     add(&color, &gettext("Vibrance"), -100.0, 100.0, 0, None, |p| &mut p.vibrance);
     add(&color, &gettext("Shadow saturation"), -100.0, 100.0, 0, None, |p| &mut p.sat_shadows);
     add(&color, &gettext("Highlight saturation"), -100.0, 100.0, 0, None, |p| &mut p.sat_highlights);
-    panel.append(&section(&gettext("Color"), &color));
+    panel.append(&bypassable(&gettext("Color"), &color, Some(Stage::Color), sender));
 
     // Primaries: lift / gamma / gain / offset wheels with a master slider each.
     let wheels_row = gtk::Grid::builder().column_spacing(10).row_spacing(10).column_homogeneous(true).build();
@@ -607,7 +669,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
         wheels_row.attach(&col, (i % 2) as i32, (i / 2) as i32, 1, 1);
         wheels.push((wheel, luma));
     }
-    panel.append(&section(&gettext("Primary color wheels"), &wheels_row));
+    panel.append(&bypassable(&gettext("Primary color wheels"), &wheels_row, Some(Stage::Wheels), sender));
 
     // HSL mixer (OKLCh bands)
     let hsl = vbox(6);
@@ -647,7 +709,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
         hsl.append(&s.root);
         s
     });
-    panel.append(&section(&gettext("Selective color"), &hsl));
+    panel.append(&bypassable(&gettext("Selective color"), &hsl, Some(Stage::Selective), sender));
 
     // Curves
     let snd = sender.clone();
@@ -682,7 +744,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
             .build(),
     );
     curve_box.append(&reset_curve);
-    panel.append(&section(&gettext("Curves"), &curve_box));
+    panel.append(&bypassable(&gettext("Curves"), &curve_box, Some(Stage::Curves), sender));
 
     // LUTs after the grade
     let look_box = vbox(8);
@@ -718,7 +780,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
             .xalign(0.0)
             .build(),
     );
-    panel.append(&section(&gettext("LUTs"), &look_box));
+    panel.append(&bypassable(&gettext("LUTs"), &look_box, None, sender));
 
     let reset = gtk::Button::builder()
         .label(gettext("Reset all"))
@@ -1208,6 +1270,8 @@ impl SimpleComponent for App {
             page: Page::Grade,
             lab_layers: Vec::new(),
             looks: Vec::new(),
+            bypassed: Vec::new(),
+            looks_off: false,
             lab_input: Profile::Standard,
             lab_blend: Blend::Chain,
             profile: Profile::Standard,
@@ -1406,7 +1470,7 @@ impl SimpleComponent for App {
                         });
                     }
                     What::Grade => self.send(Job::Export {
-                        grade: self.grade.clone(),
+                        grade: self.graded(),
                         look: self.look_layers(),
                         size,
                         format,
@@ -1506,6 +1570,17 @@ impl SimpleComponent for App {
                 // Index 0 shows everything; otherwise only LUTs of that sub-folder.
                 self.group = (sel as usize).checked_sub(1).and_then(|i| self.group_names.get(i)).cloned();
                 self.filter_gallery();
+            }
+            Msg::Bypass(Some(stage), off) => {
+                self.bypassed.retain(|&s| s != stage);
+                if off {
+                    self.bypassed.push(stage);
+                }
+                self.render();
+            }
+            Msg::Bypass(None, off) => {
+                self.looks_off = off;
+                self.layers_changed(Layers::Look, false, &sender);
             }
             Msg::Search(text) => {
                 self.query = text.to_lowercase();
