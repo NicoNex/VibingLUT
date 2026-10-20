@@ -11,7 +11,7 @@ use relm4::gtk::{gdk, gio, glib};
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk};
 use vibinglut_core::gpu::{self, Done, Job};
 use vibinglut_core::grade::{Curve, Grade, Params};
-use vibinglut_core::lut::Lut3d;
+use vibinglut_core::lut::{Format, Lut3d, VLT_SIZE};
 use vibinglut_core::photo::{Photo, RASTER_EXTS, RAW_EXTS};
 use vibinglut_core::profiles::Profile;
 use vibinglut_core::scopes::{HIST_H, HIST_W, Scopes, VEC_SIZE};
@@ -35,8 +35,9 @@ enum Msg {
     ResetAll,
     Compare(bool),
     Split(f32),
-    Export(usize),
-    ExportTo(usize, PathBuf),
+    /// Format, lattice size, and whether to write the neutral (identity) LUT.
+    Export(Format, usize, bool),
+    ExportTo(Format, usize, bool, PathBuf),
     ChooseFolder,
     Folder(PathBuf),
     GalleryLoaded(Vec<(String, Lut3d)>, Vec<String>),
@@ -233,6 +234,8 @@ scale.track-temp trough highlight, scale.track-tint trough highlight, scale.trac
 .thumb-card { padding: 6px; border-radius: 12px; }
 .thumb-card picture { border-radius: 8px; }
 flowboxchild:selected .thumb-card { background-color: color-mix(in srgb, var(--accent-bg-color) 30%, transparent); }
+.lut-badge { margin: 5px; padding: 1px 6px; border-radius: 6px; font-size: 0.68em; font-weight: 800;
+  letter-spacing: 0.04em; color: rgba(255,255,255,0.92); background-color: rgba(0,0,0,0.45); }
 .osd-info { padding: 4px 10px; border-radius: 99px; font-size: 0.9em; }
 "#;
 
@@ -652,9 +655,18 @@ impl SimpleComponent for App {
         );
 
         let export_menu = gio::Menu::new();
-        export_menu.append(Some("Lumix S9 · 33³ .cube"), Some("win.export(33)"));
-        export_menu.append(Some("Post-produzione · 65³ .cube"), Some("win.export(65)"));
-        export_menu.append(Some("Alta precisione · 129³ .cube"), Some("win.export(129)"));
+        let camera = gio::Menu::new();
+        camera.append(Some("Lumix · 33³ .cube"), Some("win.export::cube-33"));
+        camera.append(Some("Lumix / VariCam · 17³ .vlt"), Some("win.export::vlt-17"));
+        export_menu.append_section(Some("Fotocamera"), &camera);
+        let post = gio::Menu::new();
+        post.append(Some("Post-produzione · 65³ .cube"), Some("win.export::cube-65"));
+        post.append(Some("Alta precisione · 129³ .cube"), Some("win.export::cube-129"));
+        post.append(Some("HALD CLUT · 64³ .png"), Some("win.export::hald-64"));
+        export_menu.append_section(Some("Post-produzione"), &post);
+        let tools = gio::Menu::new();
+        tools.append(Some("HALD identità · .png"), Some("win.export::identity-64"));
+        export_menu.append_section(Some("Strumenti"), &tools);
         let export = adw::SplitButton::builder()
             .label("Esporta LUT")
             .menu_model(&export_menu)
@@ -663,7 +675,7 @@ impl SimpleComponent for App {
             .sensitive(false)
             .build();
         let snd = sender.clone();
-        export.connect_clicked(move |_| snd.input(Msg::Export(33)));
+        export.connect_clicked(move |_| snd.input(Msg::Export(Format::Cube, 33, false)));
         header.pack_end(&export);
 
         let compare_btn =
@@ -700,10 +712,20 @@ impl SimpleComponent for App {
         window.add_breakpoint(bp);
 
         // ---------------- actions & shortcuts
-        let export_action = gio::SimpleAction::new("export", Some(glib::VariantTy::INT32));
+        let export_action = gio::SimpleAction::new("export", Some(glib::VariantTy::STRING));
         let snd = sender.clone();
         export_action.connect_activate(move |_, v| {
-            snd.input(Msg::Export(v.and_then(|v| v.get::<i32>()).unwrap_or(33) as usize))
+            // Target "<kind>-<size>", e.g. "vlt-17", "identity-64".
+            let Some(target) = v.and_then(|v| v.str().map(str::to_owned)) else { return };
+            let Some((kind, size)) = target.split_once('-') else { return };
+            let size = size.parse().unwrap_or(33);
+            let (format, identity) = match kind {
+                "vlt" => (Format::Vlt, false),
+                "hald" => (Format::Hald, false),
+                "identity" => (Format::Hald, true),
+                _ => (Format::Cube, false),
+            };
+            snd.input(Msg::Export(format, size, identity));
         });
         window.add_action(&export_action);
         let background =
@@ -961,25 +983,41 @@ impl SimpleComponent for App {
                     self.refresh();
                 }
             }
-            Msg::Export(size) => {
-                let Some(path) = &self.path else { return };
-                let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "grade".into());
+            Msg::Export(format, size, identity) => {
+                let stem = match (&self.path, identity) {
+                    (_, true) => format!("hald_identity_{size}"),
+                    (Some(p), false) => {
+                        let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                        format!("{stem}_{}_{size}", self.profile.tag())
+                    }
+                    (None, false) => return,
+                };
+                let label = format!("{} {size}³", format.badge());
                 let dialog = gtk::FileDialog::builder()
-                    .title(format!("Esporta LUT {size}³"))
-                    .initial_name(format!("{stem}_{}_{size}.cube", self.profile.tag()))
-                    .filters(&file_filters("LUT .cube", &["cube".into()]))
+                    .title(format!("Esporta {label}"))
+                    .initial_name(format!("{stem}.{}", format.ext()))
+                    .filters(&file_filters(&label, &[format.ext().into()]))
                     .modal(true)
                     .build();
                 let s = sender.clone();
                 dialog.save(Some(&self.ui.window), gio::Cancellable::NONE, move |r| {
                     if let Some(p) = r.ok().and_then(|f| f.path()) {
-                        s.input(Msg::ExportTo(size, p));
+                        s.input(Msg::ExportTo(format, size, identity, p));
                     }
                 });
             }
-            Msg::ExportTo(size, path) => {
+            Msg::ExportTo(format, size, true, path) => {
+                // The neutral HALD needs no GPU: write it off the main thread.
+                let s = sender.input_sender().clone();
+                std::thread::spawn(move || {
+                    let r = Lut3d::identity(size, format).save(&path).map(|_| path);
+                    s.emit(Msg::Gpu(Done::Exported(r)));
+                });
+            }
+            Msg::ExportTo(format, size, false, path) => {
                 let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                self.send(Job::Export { grade: self.grade.clone(), size, title, path });
+                let size = if format == Format::Vlt { VLT_SIZE } else { size };
+                self.send(Job::Export { grade: self.grade.clone(), size, format, title, path });
             }
             Msg::ChooseFolder => {
                 let dialog = gtk::FileDialog::builder().title("Cartella LUT").modal(true).build();
@@ -1012,9 +1050,17 @@ impl SimpleComponent for App {
                 self.ui.thumbs.clear();
                 for (group, lut) in &luts {
                     let pic = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).height_request(96).build();
+                    let badge = gtk::Label::builder()
+                        .label(lut.format.badge())
+                        .halign(gtk::Align::End)
+                        .valign(gtk::Align::Start)
+                        .css_classes(["lut-badge"])
+                        .build();
+                    let framed = gtk::Overlay::builder().child(&pic).build();
+                    framed.add_overlay(&badge);
                     let card = vbox(4);
                     card.add_css_class("thumb-card");
-                    card.append(&pic);
+                    card.append(&framed);
                     card.append(
                         &gtk::Label::builder()
                             .label(&lut.title)
@@ -1023,7 +1069,12 @@ impl SimpleComponent for App {
                             .build(),
                     );
                     let place = if group.is_empty() { String::new() } else { format!("{group} · ") };
-                    card.set_tooltip_text(Some(&format!("{place}{} · {}³", lut.title, lut.size)));
+                    card.set_tooltip_text(Some(&format!(
+                        "{place}{} · {} {}³",
+                        lut.title,
+                        lut.format.badge(),
+                        lut.size
+                    )));
                     self.ui.flow.append(&card);
                     self.ui.thumbs.push(pic);
                 }

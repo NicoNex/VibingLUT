@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use wgpu::util::DeviceExt;
 
 use crate::grade::{CURVE_RES, Grade, Params};
-use crate::lut::Lut3d;
+use crate::lut::{Format, Lut3d};
 use crate::photo::{Photo, THUMB_MAX};
 use crate::scopes::Scopes;
 
@@ -193,7 +193,7 @@ impl Gpu {
         let bind = self.bind(&self.bake, &[(0, &self.params), (1, &self.curves), (4, &out)]);
         let bytes = self.run(&self.bake, &bind, n, &out, &staging);
         let data = bytemuck::cast_slice::<u8, [f32; 4]>(&bytes).iter().map(|&[r, g, b, _]| [r, g, b]).collect();
-        Lut3d { title, size, data }
+        Lut3d { title, size, data, format: Default::default() }
     }
 }
 
@@ -210,6 +210,7 @@ pub enum Job {
     Export {
         grade: Grade,
         size: usize,
+        format: Format,
         title: String,
         path: PathBuf,
     },
@@ -277,9 +278,9 @@ impl Worker {
                     notify(Done::Thumb { generation, index, width: th.width, height: th.height, rgba });
                 }
             }
-            Job::Export { grade, size, title, path } => {
-                let cube = gpu.bake(&grade, size, title).to_cube();
-                notify(Done::Exported(std::fs::write(&path, cube).map(|_| path).map_err(|e| e.to_string())));
+            Job::Export { grade, size, format, title, path } => {
+                let lut = Lut3d { format, ..gpu.bake(&grade, size, title) };
+                notify(Done::Exported(lut.save(&path).map(|_| path)));
             }
         }
     }
