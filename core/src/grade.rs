@@ -5,6 +5,8 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::profiles::Profile;
+
 /// Resolution of each baked tone curve sent to the GPU.
 pub const CURVE_RES: usize = 1024;
 
@@ -34,8 +36,10 @@ pub struct Params {
     pub hue_shift: [f32; 8],
     pub hue_sat: [f32; 8],
     pub hue_lum: [f32; 8],
-    /// [`Profile`] of the input signal (the LUT's input domain).
+    /// Input decoder id ([`Profile::curve`]); 0 = display-referred Rec.709.
     pub input: u32,
+    /// Row-major camera gamut → Rec.709 matrix for log inputs.
+    pub gamut: [f32; 9],
     /// 0 = off, otherwise fraction of the width showing the ungraded image.
     pub split: f32,
     pub width: u32,
@@ -43,14 +47,12 @@ pub struct Params {
     pub lut_size: u32,
 }
 
-/// Camera signal the LUT will be applied to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Profile {
-    /// Display-referred Rec.709 / sRGB (camera Standard, Vivid, … photo styles).
-    #[default]
-    Standard,
-    /// Panasonic V-Log / V-Gamut: the LUT maps V-Log to Rec.709.
-    VLog,
+impl Params {
+    /// Makes the LUT's input domain the signal of `profile`.
+    pub fn set_input(&mut self, profile: Profile) {
+        self.input = profile.curve();
+        self.gamut = bytemuck::cast(profile.to_rec709());
+    }
 }
 
 /// Control points of one curve, sorted by x, endpoints included.
@@ -135,8 +137,8 @@ mod tests {
 
     #[test]
     fn params_layout_matches_wgsl() {
-        // 12 scalars + 4×4 wheels + 3×8 hue + input,split,width,height,lut_size
-        assert_eq!(std::mem::size_of::<Params>(), (12 + 16 + 24 + 5) * 4);
+        // 12 scalars + 4×4 wheels + 3×8 hue + input + 3×3 gamut + split,width,height,lut_size
+        assert_eq!(std::mem::size_of::<Params>(), (12 + 16 + 24 + 1 + 9 + 4) * 4);
     }
 
     #[test]

@@ -10,9 +10,10 @@ use relm4::adw::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk};
 use vibinglut_core::gpu::{self, Done, Job};
-use vibinglut_core::grade::{Curve, Grade, Params, Profile};
+use vibinglut_core::grade::{Curve, Grade, Params};
 use vibinglut_core::lut::Lut3d;
 use vibinglut_core::photo::{Photo, RASTER_EXTS, RAW_EXTS};
+use vibinglut_core::profiles::Profile;
 use vibinglut_core::scopes::{HIST_H, HIST_W, Scopes, VEC_SIZE};
 use widgets::{ColorWheel, CurveEditor, Slider};
 
@@ -285,22 +286,20 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
 
     // Input profile: the signal the LUT will receive in camera.
     let profile_box = vbox(6);
-    let profile_sel = toggles(&[("standard", "Standard · Rec.709"), ("vlog", "V-Log")]);
+    let names: Vec<&str> = Profile::ALL.iter().map(|p| p.name()).collect();
+    let profile_sel = gtk::DropDown::from_strings(&names);
+    profile_sel.update_property(&[gtk::accessible::Property::Label("Profilo di ingresso")]);
     let hint = gtk::Label::builder()
-        .label("Segnale su cui il LUT verrà applicato (Photo Style della camera).")
+        .label(profile_hint(Profile::Standard))
         .css_classes(["caption", "dim-label"])
         .wrap(true)
         .xalign(0.0)
         .build();
     let (snd, h) = (sender.clone(), hint.clone());
-    profile_sel.connect_active_name_notify(move |g| {
-        let vlog = g.active_name().as_deref() == Some("vlog");
-        h.set_label(if vlog {
-            "LUT V-Log/V-Gamut → Rec.709. Per i RAW la foto viene codificata in V-Log; un JPEG va scattato in V-Log."
-        } else {
-            "Segnale su cui il LUT verrà applicato (Photo Style della camera)."
-        });
-        snd.input(Msg::Profile(if vlog { Profile::VLog } else { Profile::Standard }));
+    profile_sel.connect_selected_notify(move |d| {
+        let profile = Profile::ALL[d.selected() as usize];
+        h.set_label(&profile_hint(profile));
+        snd.input(Msg::Profile(profile));
     });
     profile_box.append(&profile_sel);
     profile_box.append(&hint);
@@ -887,12 +886,12 @@ impl SimpleComponent for App {
                 self.ui.window.set_title(Some(&format!("{name} — VibingLUT")));
                 self.ui.info.set_label(&format!(
                     "{name} · {} · {}×{} anteprima",
-                    profile_name(profile),
+                    profile.name(),
                     photo.width,
                     photo.height
                 ));
                 // The shader decodes the profile the pixels were actually encoded in.
-                self.grade.params.input = profile as u32;
+                self.grade.params.set_input(profile);
                 self.send(Job::SetPhoto(photo));
                 self.path = Some(path);
                 self.sent = None;
@@ -947,9 +946,9 @@ impl SimpleComponent for App {
                     l.reset();
                 }
                 self.ui.sidebar.curves.reset_all();
-                let input = self.grade.params.input;
+                let (input, gamut) = (self.grade.params.input, self.grade.params.gamut);
                 self.grade = Grade::default();
-                self.grade.params.input = input;
+                (self.grade.params.input, self.grade.params.gamut) = (input, gamut);
                 self.render();
             }
             Msg::Compare(on) => {
@@ -967,7 +966,7 @@ impl SimpleComponent for App {
                 let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "grade".into());
                 let dialog = gtk::FileDialog::builder()
                     .title(format!("Esporta LUT {size}³"))
-                    .initial_name(format!("{stem}_{}_{size}.cube", profile_tag(self.profile)))
+                    .initial_name(format!("{stem}_{}_{size}.cube", self.profile.tag()))
                     .filters(&file_filters("LUT .cube", &["cube".into()]))
                     .modal(true)
                     .build();
@@ -1116,17 +1115,14 @@ impl App {
     }
 }
 
-fn profile_name(p: Profile) -> &'static str {
-    match p {
-        Profile::Standard => "Standard",
-        Profile::VLog => "V-Log",
-    }
-}
-
-fn profile_tag(p: Profile) -> &'static str {
-    match p {
-        Profile::Standard => "709",
-        Profile::VLog => "VLog",
+fn profile_hint(p: Profile) -> String {
+    if p.is_log() {
+        format!(
+            "LUT {} → Rec.709. I RAW vengono codificati in questo log; un JPEG/TIFF deve essere già in log.",
+            p.name()
+        )
+    } else {
+        "Segnale su cui il LUT verrà applicato (Photo Style Standard, Vivid…).".into()
     }
 }
 

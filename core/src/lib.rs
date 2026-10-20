@@ -5,4 +5,5 @@ pub mod gpu;
 pub mod grade;
 pub mod lut;
 pub mod photo;
+pub mod profiles;
 pub mod scopes;

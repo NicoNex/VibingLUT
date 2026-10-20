@@ -9,7 +9,7 @@ use image::{DynamicImage, ImageDecoder, ImageReader, Rgba32FImage};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::srgb::srgb_apply_gamma;
 
-use crate::grade::Profile;
+use crate::profiles::Profile;
 
 pub const PREVIEW_MAX: u32 = 2048;
 pub const THUMB_MAX: u32 = 384;
@@ -121,26 +121,18 @@ fn load_raw(path: &Path, profile: Profile) -> Result<Photo, String> {
     let mut photo = Photo::from_image(img.into_rgba32f());
     for p in &mut photo.pixels {
         let scene = [p[0], p[1], p[2]].map(|v| v * RAW_TO_SCENE);
-        let [r, g, b] = match profile {
-            Profile::Standard => view_transform(scene),
-            Profile::VLog => mat3(&REC709_TO_VGAMUT, scene).map(vlog_encode),
+        let [r, g, b] = if profile.is_log() {
+            mat3(&profile.from_rec709(), scene).map(|v| profile.encode(v))
+        } else {
+            view_transform(scene)
         };
         *p = [r, g, b, 1.0];
     }
     Ok(photo)
 }
 
-/// Linear Rec.709 → V-Gamut (Panasonic V-Gamut primaries, D65).
-const REC709_TO_VGAMUT: [[f32; 3]; 3] =
-    [[0.585197, 0.322642, 0.092162], [0.078588, 0.819627, 0.101784], [0.022794, 0.114217, 0.862989]];
-
-fn mat3(m: &[[f32; 3]; 3], c: [f32; 3]) -> [f32; 3] {
+pub(crate) fn mat3(m: &[[f32; 3]; 3], c: [f32; 3]) -> [f32; 3] {
     m.map(|row| row[0] * c[0] + row[1] * c[1] + row[2] * c[2])
-}
-
-/// Panasonic V-Log OETF (scene linear reflection → code value).
-pub fn vlog_encode(l: f32) -> f32 {
-    if l < 0.01 { 5.6 * l + 0.125 } else { 0.241514 * (l + 0.00873).log10() + 0.598206 }
 }
 
 /// Scene-linear scale of rawler output: Lumix RAWs sit ~0.8 EV under scene grey.
@@ -158,18 +150,4 @@ pub fn view_transform(lin: [f32; 3]) -> [f32; 3] {
     let m = c[0].max(c[1]).max(c[2]);
     let k = if m > 0.0 { (1.0 + m / (VIEW_WHITE * VIEW_WHITE)) / (1.0 + m) } else { 0.0 };
     c.map(|v| srgb_apply_gamma((v * k).min(1.0)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn vlog_matches_panasonic_reference() {
-        // Panasonic: 18% grey → 42% code value, 0% → 7.3% (10-bit 128/1023 ≈ 0.125).
-        assert!((vlog_encode(0.18) - 0.4233).abs() < 1e-3);
-        assert!((vlog_encode(0.0) - 0.125).abs() < 1e-6);
-        // Continuous at the linear/log breakpoint.
-        assert!((vlog_encode(0.00999) - vlog_encode(0.01)).abs() < 1e-3);
-    }
 }

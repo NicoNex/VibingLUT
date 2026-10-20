@@ -8,7 +8,7 @@ struct Params {
     saturation: f32, vibrance: f32, sat_shadows: f32, sat_highlights: f32,
     lift: array<f32, 4>, gamma: array<f32, 4>, gain: array<f32, 4>, offset: array<f32, 4>,
     hue_shift: array<f32, 8>, hue_sat: array<f32, 8>, hue_lum: array<f32, 8>,
-    input: u32, split: f32, width: u32, height: u32, lut_size: u32,
+    input: u32, gamut: array<f32, 9>, split: f32, width: u32, height: u32, lut_size: u32,
 }
 
 @group(0) @binding(0) var<storage, read> p: Params;
@@ -35,19 +35,71 @@ fn lin_to_srgb(c: vec3<f32>) -> vec3<f32> {
 }
 
 // ---------------------------------------------------------- input profile
-// V-Log input is scene-referred: decode it, move V-Gamut to Rec.709 and apply
-// the same neutral view transform used for RAW (photo.rs), so the grade below
-// always starts from a display-referred Rec.709 image.
+// Log input is scene-referred: decode the manufacturer curve (inverse of
+// `Profile::encode` in profiles.rs), convert the camera gamut to Rec.709 and
+// apply the same neutral view transform used for RAW (photo.rs), so the
+// grade below always starts from a display-referred Rec.709 image.
 
-const VGAMUT_TO_709 = mat3x3<f32>(  // column-major
-    vec3(1.806574, -0.170089, -0.025206),
-    vec3(-0.695698, 1.305955, -0.154468),
-    vec3(-0.110879, -0.135865, 1.179674));
 const VIEW_EXPOSURE: f32 = 1.25;
 const VIEW_WHITE: f32 = 6.0;
 
-fn vlog_to_lin(v: vec3<f32>) -> vec3<f32> {
-    return select(pow(vec3(10.0), (v - 0.598206) / 0.241514) - 0.00873, (v - 0.125) / 5.6, v < vec3(0.181));
+fn pow10(x: vec3<f32>) -> vec3<f32> { return exp2(x * 3.321928095); }
+
+fn decode(id: u32, v: vec3<f32>) -> vec3<f32> {
+    switch id {
+        case 1u: { // Panasonic V-Log
+            return select(pow10((v - 0.598206) / 0.241514) - 0.00873, (v - 0.125) / 5.6, v < vec3(0.181));
+        }
+        case 2u: { // Sony S-Log3
+            let cv = v * 1023.0;
+            return select((cv - 95.0) * 0.01125 / (171.2102946929 - 95.0), pow10((cv - 420.0) / 261.5) * 0.19 - 0.01, cv >= vec3(171.2102946929));
+        }
+        case 3u: { // Canon C-Log3 (legal-range IRE, reflection = 0.9 × linear)
+            let c = (v * 1023.0 - 64.0) / 876.0;
+            let lo = -(pow10((0.12783901 - c) / 0.36726845) - 1.0) / 14.98325;
+            let mid = (c - 0.12512219) / 1.9754798;
+            let hi = (pow10((c - 0.12240537) / 0.36726845) - 1.0) / 14.98325;
+            return select(select(lo, mid, c >= vec3(0.097465473)), hi, c > vec3(0.15277891)) * 0.9;
+        }
+        case 4u: { // Fujifilm F-Log
+            return select((v - 0.092864) / 8.735631, (pow10((v - 0.790453) / 0.344676) - 0.009468) / 0.555556, v >= vec3(0.100537775223865));
+        }
+        case 5u: { // Fujifilm F-Log2
+            return select((v - 0.092864) / 8.799461, (pow10((v - 0.384316) / 0.245281) - 0.064829) / 5.555556, v >= vec3(0.100686685370811));
+        }
+        case 6u: { // Nikon N-Log
+            let cv = v * 1023.0;
+            let x = cv / 650.0;
+            return select(x * x * x - 0.0075, exp((cv - 619.0) / 150.0), cv >= vec3(452.0));
+        }
+        case 7u: { // ARRI LogC3 EI 800
+            return select((v - 0.092809) / 5.367655, (pow10((v - 0.385537) / 0.247190) - 0.052272) / 5.555556, v > vec3(0.149658));
+        }
+        case 8u: { // ARRI LogC4
+            let a = (262144.0 - 16.0) / 117.45;
+            let b = (1023.0 - 95.0) / 1023.0;
+            let c = 95.0 / 1023.0;
+            let s = (7.0 * 0.6931471806 * exp2(7.0 - 14.0 * c / b)) / (a * b);
+            let t = (exp2(14.0 * (-c / b) + 6.0) - 64.0) / a;
+            return select(v * s + t, (exp2(14.0 * (v - c) / b + 6.0) - 64.0) / a, v >= vec3(0.0));
+        }
+        case 9u: { // Blackmagic Film Gen 5
+            return select((v - 0.09246575342) / 8.283605932, exp((v - 0.5300133392) / 0.08692876065) - 0.005494072432, v >= vec3(8.283605932 * 0.005 + 0.09246575342));
+        }
+        case 10u: { // DJI D-Log
+            return select((v - 0.0929) / 6.025, (pow10(3.89616 * v - 2.27752) - 0.0108) / 0.9892, v > vec3(0.14));
+        }
+        case 11u: { // RED Log3G10
+            return select(v / 15.1927, (pow10(v / 0.224282) - 1.0) / 155.975327, v >= vec3(0.0)) - 0.01;
+        }
+        case 12u: { // Apple Log
+            let r0 = -0.05641088;
+            let pt = 47.28711236 * (0.01 - r0) * (0.01 - r0);
+            let curve = select(vec3(r0), sqrt(max(v, vec3(0.0)) / 47.28711236) + r0, v >= vec3(0.0));
+            return select(curve, exp2((v - 0.69336945) / 0.08550479) - 0.00964052, v >= vec3(pt));
+        }
+        default: { return v; }
+    }
 }
 
 // Hue-preserving extended Reinhard shoulder, then sRGB. Mirrors photo::view_transform.
@@ -59,8 +111,10 @@ fn view_transform(lin: vec3<f32>) -> vec3<f32> {
 }
 
 fn to_display(c: vec3<f32>) -> vec3<f32> {
-    if p.input == 1u { return view_transform(VGAMUT_TO_709 * vlog_to_lin(c)); }
-    return c;
+    if p.input == 0u { return c; }
+    let g = p.gamut; // row-major
+    let to709 = mat3x3<f32>(vec3(g[0], g[3], g[6]), vec3(g[1], g[4], g[7]), vec3(g[2], g[5], g[8]));
+    return view_transform(to709 * decode(p.input, c));
 }
 
 // ---------------------------------------------------------- white balance

@@ -363,30 +363,37 @@ mod tests {
         assert!(worst <= 8 && mean < 0.5, "65³ LUT vs direct grade: worst {worst}/255, mean {mean}");
     }
 
-    /// V-Log input: the GPU decode + view transform must reproduce what the
-    /// CPU renders for Standard, so both profiles start from the same look.
+    /// Every log profile: CPU encode (gamut + OETF) followed by the GPU
+    /// decode + view transform must reproduce the CPU view transform, so all
+    /// profiles start from the same look and the decoders match the encoders.
     #[test]
-    fn vlog_input_matches_cpu_view_transform() {
-        use crate::grade::Profile;
-        use crate::photo::{view_transform, vlog_encode};
+    fn log_inputs_match_cpu_view_transform() {
+        use crate::photo::{mat3, view_transform};
+        use crate::profiles::Profile;
         let Ok(gpu) = Gpu::new() else { return eprintln!("no GPU, skipped") };
-        let greys = [0.0f32, 0.02, 0.09, 0.18, 0.36, 0.9, 2.0];
-        let photo = Photo {
-            width: greys.len() as u32,
-            height: 1,
-            pixels: greys
-                .map(|g| {
-                    let v = vlog_encode(g);
-                    [v, v, v, 1.0]
+        let scene: Vec<[f32; 3]> = [0.0f32, 0.02, 0.09, 0.18, 0.36, 0.9, 2.0]
+            .iter()
+            .map(|&g| [g; 3])
+            .chain([[0.30, 0.12, 0.05], [0.05, 0.20, 0.40], [0.10, 0.25, 0.08]])
+            .collect();
+        for profile in Profile::ALL.into_iter().filter(|p| p.is_log()) {
+            let pixels = scene
+                .iter()
+                .map(|&c| {
+                    let [r, g, b] = mat3(&profile.from_rec709(), c).map(|v| profile.encode(v));
+                    [r, g, b, 1.0]
                 })
-                .to_vec(),
-        };
-        let mut grade = Grade::default();
-        grade.params.input = Profile::VLog as u32;
-        let out = gpu.render(&gpu.upload(&photo), &grade, 0.0);
-        for (i, g) in greys.iter().enumerate() {
-            let want = (view_transform([*g; 3])[0] * 255.0).round() as i32;
-            assert!((out[i * 4] as i32 - want).abs() <= 1, "grey {g}: gpu {} cpu {want}", out[i * 4]);
+                .collect();
+            let photo = Photo { width: scene.len() as u32, height: 1, pixels };
+            let mut grade = Grade::default();
+            grade.params.set_input(profile);
+            let out = gpu.render(&gpu.upload(&photo), &grade, 0.0);
+            for (i, c) in scene.iter().enumerate() {
+                let want = view_transform(*c).map(|v| (v * 255.0).round() as i32);
+                let got = [0, 1, 2].map(|k| out[i * 4 + k] as i32);
+                let ok = (0..3).all(|k| (got[k] - want[k]).abs() <= 2);
+                assert!(ok, "{profile:?} {c:?}: gpu {got:?} cpu {want:?}");
+            }
         }
     }
 }
