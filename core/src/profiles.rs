@@ -88,6 +88,31 @@ impl Profile {
         }
     }
 
+    /// Best guess of the input profile a LUT file was made for, from its
+    /// name (vendors put it there, e.g. `XH2S_FLog_FGamut_to_ETERNA_BT.709`).
+    pub fn guess_from_name(name: &str) -> Profile {
+        let n: String = name.to_ascii_lowercase().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        // Longest / most specific tokens first.
+        const TOKENS: [(&str, Profile); 15] = [
+            ("flog2", Profile::FLog2),
+            ("flog", Profile::FLog),
+            ("vlog", Profile::VLog),
+            ("vgamut", Profile::VLog),
+            ("sgamut3cine", Profile::SLog3Cine),
+            ("slog3", Profile::SLog3),
+            ("clog3", Profile::CLog3),
+            ("nlog", Profile::NLog),
+            ("logc4", Profile::LogC4),
+            ("logc", Profile::LogC3),
+            ("bmdfilm", Profile::BmdFilmGen5),
+            ("blackmagicfilm", Profile::BmdFilmGen5),
+            ("dlog", Profile::DLog),
+            ("log3g10", Profile::Log3G10),
+            ("applelog", Profile::AppleLog),
+        ];
+        TOKENS.iter().find(|(t, _)| n.contains(t)).map_or(Profile::Standard, |(_, p)| *p)
+    }
+
     /// Decoder id in `grade.wgsl` (0 = display-referred, no decode).
     pub fn curve(self) -> u32 {
         match self {
@@ -242,6 +267,101 @@ impl Profile {
     }
 }
 
+impl Profile {
+    /// Inverse of [`Profile::encode`]: code value → scene-linear reflectance.
+    /// Mirrors `decode()` in `grade.wgsl` (tests keep them in sync).
+    pub fn decode(self, v: f32) -> f32 {
+        let v = v as f64;
+        let pow10 = |x: f64| 10f64.powf(x);
+        let l = match self {
+            Profile::Standard => v,
+            Profile::VLog => {
+                if v < 0.181 {
+                    (v - 0.125) / 5.6
+                } else {
+                    pow10((v - 0.598206) / 0.241514) - 0.00873
+                }
+            }
+            Profile::SLog3Cine | Profile::SLog3 => {
+                let cv = v * 1023.0;
+                if cv >= 171.2102946929 {
+                    pow10((cv - 420.0) / 261.5) * 0.19 - 0.01
+                } else {
+                    (cv - 95.0) * 0.01125 / (171.2102946929 - 95.0)
+                }
+            }
+            Profile::CLog3 => {
+                let c = (v * 1023.0 - 64.0) / 876.0;
+                let x = if c < 0.097465473 {
+                    -(pow10((0.12783901 - c) / 0.36726845) - 1.0) / 14.98325
+                } else if c <= 0.15277891 {
+                    (c - 0.12512219) / 1.9754798
+                } else {
+                    (pow10((c - 0.12240537) / 0.36726845) - 1.0) / 14.98325
+                };
+                x * 0.9
+            }
+            Profile::FLog => {
+                if v >= 0.100537775223865 {
+                    (pow10((v - 0.790453) / 0.344676) - 0.009468) / 0.555556
+                } else {
+                    (v - 0.092864) / 8.735631
+                }
+            }
+            Profile::FLog2 => {
+                if v >= 0.100686685370811 {
+                    (pow10((v - 0.384316) / 0.245281) - 0.064829) / 5.555556
+                } else {
+                    (v - 0.092864) / 8.799461
+                }
+            }
+            Profile::NLog => {
+                let cv = v * 1023.0;
+                if cv >= 452.0 { ((cv - 619.0) / 150.0).exp() } else { (cv / 650.0).powi(3) - 0.0075 }
+            }
+            Profile::LogC3 => {
+                if v > 0.149658 {
+                    (pow10((v - 0.385537) / 0.247190) - 0.052272) / 5.555556
+                } else {
+                    (v - 0.092809) / 5.367655
+                }
+            }
+            Profile::LogC4 => {
+                let (a, b, c) = LOGC4;
+                let s = (7.0 * std::f64::consts::LN_2 * 2f64.powf(7.0 - 14.0 * c / b)) / (a * b);
+                let t = (2f64.powf(14.0 * (-c / b) + 6.0) - 64.0) / a;
+                if v >= 0.0 { (2f64.powf(14.0 * (v - c) / b + 6.0) - 64.0) / a } else { v * s + t }
+            }
+            Profile::BmdFilmGen5 => {
+                if v >= 8.283605932 * 0.005 + 0.09246575342 {
+                    ((v - 0.5300133392) / 0.08692876065).exp() - 0.005494072432
+                } else {
+                    (v - 0.09246575342) / 8.283605932
+                }
+            }
+            Profile::DLog => {
+                if v > 0.14 {
+                    (pow10(3.89616 * v - 2.27752) - 0.0108) / 0.9892
+                } else {
+                    (v - 0.0929) / 6.025
+                }
+            }
+            Profile::Log3G10 => (if v >= 0.0 { (pow10(v / 0.224282) - 1.0) / 155.975327 } else { v / 15.1927 }) - 0.01,
+            Profile::AppleLog => {
+                let (r0, rt, c, b, g, beta) = APPLE_LOG;
+                if v >= c * (rt - r0) * (rt - r0) {
+                    2f64.powf((v - beta) / g) - b
+                } else if v >= 0.0 {
+                    (v / c).sqrt() + r0
+                } else {
+                    r0
+                }
+            }
+        };
+        l as f32
+    }
+}
+
 const LOGC4: (f64, f64, f64) = ((262144.0 - 16.0) / 117.45, (1023.0 - 95.0) / 1023.0, 95.0 / 1023.0);
 const APPLE_LOG: (f64, f64, f64, f64, f64, f64) = (-0.05641088, 0.01, 47.28711236, 0.00964052, 0.08550479, 0.69336945);
 
@@ -294,6 +414,34 @@ mod tests {
         ];
         for (p, want) in cases {
             assert!((p.encode(0.18) - want).abs() < 2e-3, "{p:?}: {} vs {want}", p.encode(0.18));
+        }
+    }
+
+    #[test]
+    fn guesses_profile_from_vendor_file_names() {
+        let cases = [
+            ("XH2S_FLog_FGamut_to_ETERNA_BT.709_33grid_V.1.00", Profile::FLog),
+            ("X-T5_F-Log2_F-Gamut_to_WDR_BT.709", Profile::FLog2),
+            ("VLog_to_V709_forV35_ver100", Profile::VLog),
+            ("SLog3SGamut3.CineToLC-709", Profile::SLog3Cine),
+            ("ARRI_LogC4_to_Rec709", Profile::LogC4),
+            ("Kodak 2383", Profile::Standard),
+        ];
+        for (name, want) in cases {
+            assert_eq!(Profile::guess_from_name(name), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn decode_inverts_encode() {
+        for p in Profile::ALL {
+            for l in [-0.005f32, 0.0, 0.003, 0.02, 0.18, 0.9, 4.0, 20.0] {
+                if p == Profile::AppleLog && l < -0.05 {
+                    continue;
+                }
+                let back = p.decode(p.encode(l));
+                assert!((back - l).abs() < 1e-3 * l.abs().max(1.0), "{p:?} {l}: {back}");
+            }
         }
     }
 

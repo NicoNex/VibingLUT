@@ -73,6 +73,31 @@ impl Lut3d {
         Self { title: "identity".into(), size, data, format }
     }
 
+    /// Tetrahedral interpolation at `c` (0..1 per channel).
+    pub fn sample(&self, c: [f32; 3]) -> [f32; 3] {
+        let n = self.size;
+        let s = (n - 1) as f32;
+        let x = c.map(|v| v.clamp(0.0, 1.0) * s);
+        let i = x.map(|v| (v as usize).min(n - 2));
+        let f: [f32; 3] = std::array::from_fn(|k| x[k] - i[k] as f32);
+        let at = |dr: usize, dg: usize, db: usize| self.data[(i[0] + dr) + n * ((i[1] + dg) + n * (i[2] + db))];
+        // Walk the cube diagonal through the corners of the tetrahedron that holds `f`.
+        let mut order = [0usize, 1, 2];
+        order.sort_by(|&a, &b| f[b].total_cmp(&f[a]));
+        let mut d = [0usize; 3];
+        let mut prev = at(0, 0, 0);
+        let mut out = prev;
+        for &axis in &order {
+            d[axis] = 1;
+            let next = at(d[0], d[1], d[2]);
+            for k in 0..3 {
+                out[k] += f[axis] * (next[k] - prev[k]);
+            }
+            prev = next;
+        }
+        out
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), String> {
         match self.format {
             Format::Cube => std::fs::write(path, self.to_cube()).map_err(|e| e.to_string()),
@@ -265,6 +290,20 @@ mod tests {
         assert_eq!(back.data[1], [0.5, 0.0, 0.0]); // red fastest
         assert_eq!(back.data[9], [0.0, 0.0, 0.5]);
         assert!(Lut3d::parse("LUT_3D_SIZE 2\n0 0 0\n").is_err());
+    }
+
+    #[test]
+    fn tetrahedral_sample_is_exact_on_linear_luts() {
+        // Tetrahedral interpolation reproduces any affine map exactly.
+        let mut l = Lut3d::identity(5, Format::Cube);
+        for c in &mut l.data {
+            *c = [0.2 + 0.5 * c[1], c[0] * 0.8, 0.1 + 0.3 * c[2] + 0.4 * c[0]];
+        }
+        for c in [[0.13, 0.77, 0.4], [0.9, 0.05, 0.6], [1.0, 1.0, 1.0], [0.0, 0.5, 0.25]] {
+            let s = l.sample(c);
+            let want = [0.2 + 0.5 * c[1], c[0] * 0.8, 0.1 + 0.3 * c[2] + 0.4 * c[0]];
+            assert!((0..3).all(|k| (s[k] - want[k]).abs() < 1e-5), "{c:?}: {s:?} vs {want:?}");
+        }
     }
 
     #[test]

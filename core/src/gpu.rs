@@ -2,13 +2,15 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use wgpu::util::DeviceExt;
 
 use crate::grade::{CURVE_RES, Grade, Params};
+use crate::lab::{self, Blend, Layer};
 use crate::lut::{Format, Lut3d};
 use crate::photo::{Photo, THUMB_MAX};
+use crate::profiles::Profile;
 use crate::scopes::Scopes;
 
 pub struct Gpu {
@@ -202,11 +204,27 @@ impl Gpu {
 pub enum Job {
     SetPhoto(Photo),
     /// Uploads the comparison LUTs once; later jobs refer to them by index.
-    SetLuts(Vec<Lut3d>),
+    SetLuts(Vec<Arc<Lut3d>>),
     Render(Grade, f32),
     ApplyLut(usize, f32),
     /// Thumbnails of every LUT; `generation` lets the UI drop stale results.
     Gallery(u64),
+    /// Preview of a LUT Lab stack on the current photo.
+    Lab {
+        input: Profile,
+        layers: Vec<Layer>,
+        blend: Blend,
+        split: f32,
+    },
+    ExportLab {
+        input: Profile,
+        layers: Vec<Layer>,
+        blend: Blend,
+        size: usize,
+        format: Format,
+        title: String,
+        path: PathBuf,
+    },
     Export {
         grade: Grade,
         size: usize,
@@ -221,6 +239,7 @@ enum Slot {
     Grade,
     Compare,
     Gallery,
+    Lab,
 }
 
 impl Job {
@@ -230,6 +249,7 @@ impl Job {
             Job::Render(..) => Some(Slot::Grade),
             Job::ApplyLut(..) => Some(Slot::Compare),
             Job::Gallery(..) => Some(Slot::Gallery),
+            Job::Lab { .. } => Some(Slot::Lab),
             _ => None,
         }
     }
@@ -241,6 +261,7 @@ pub enum Done {
     Failed(String),
     Graded { width: u32, height: u32, rgba: Vec<u8>, scopes: Scopes },
     Compared { width: u32, height: u32, rgba: Vec<u8> },
+    Lab { width: u32, height: u32, rgba: Vec<u8> },
     Thumb { generation: u64, index: usize, width: u32, height: u32, rgba: Vec<u8> },
     Exported(Result<PathBuf, String>),
 }
@@ -278,6 +299,17 @@ impl Worker {
                     notify(Done::Thumb { generation, index, width: th.width, height: th.height, rgba });
                 }
             }
+            Job::Lab { input, layers, blend, split } => {
+                let Some(ph) = &self.photo else { return };
+                // ponytail: 33³ preview lattice; exports compose at full size.
+                let lut = lab::compose(input, &layers, blend, 33, &|g| gpu.bake(g, lab::SOURCE_SIZE, String::new()));
+                let rgba = gpu.apply_lut(ph, &gpu.upload_lut(&lut), split);
+                notify(Done::Lab { width: ph.width, height: ph.height, rgba });
+            }
+            Job::ExportLab { input, layers, blend, size, format, title, path } => {
+                let lut = lab::compose(input, &layers, blend, size, &|g| gpu.bake(g, lab::SOURCE_SIZE, String::new()));
+                notify(Done::Exported(Lut3d { title, format, ..lut }.save(&path).map(|_| path)));
+            }
             Job::Export { grade, size, format, title, path } => {
                 let lut = Lut3d { format, ..gpu.bake(&grade, size, title) };
                 notify(Done::Exported(lut.save(&path).map(|_| path)));
@@ -302,7 +334,7 @@ pub fn spawn(notify: impl Fn(Done) + Send + 'static) -> mpsc::Sender<Job> {
             while let Ok(first) = rx.recv() {
                 // Keep only the newest job per slot, preserving order otherwise.
                 let mut batch: Vec<Job> = std::iter::once(first).chain(rx.try_iter()).collect();
-                let mut seen = [false; 3];
+                let mut seen = [false; 4];
                 batch.reverse();
                 batch.retain(|j| j.slot().is_none_or(|s| !std::mem::replace(&mut seen[s as usize], true)));
                 batch.reverse();

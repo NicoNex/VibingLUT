@@ -4,6 +4,7 @@
 pub mod chart;
 pub mod gpu;
 pub mod grade;
+pub mod lab;
 pub mod lut;
 pub mod photo;
 pub mod profiles;

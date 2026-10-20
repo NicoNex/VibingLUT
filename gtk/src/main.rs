@@ -1,17 +1,20 @@
 //! VibingLUT GTK4/libadwaita front-end over `vibinglut-core`.
 
+mod lab_page;
 mod settings;
 mod widgets;
 
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
+use lab_page::{LabAdd, LabKind, LabLayer, LabUi};
 use relm4::adw::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk};
 use vibinglut_core::chart::test_chart;
 use vibinglut_core::gpu::{self, Done, Job};
 use vibinglut_core::grade::{Curve, Grade, Params};
+use vibinglut_core::lab::{Blend, Layer, Source};
 use vibinglut_core::lut::{Format, Lut3d, VLT_SIZE};
 use vibinglut_core::photo::{Photo, RASTER_EXTS, RAW_EXTS};
 use vibinglut_core::profiles::Profile;
@@ -21,6 +24,22 @@ use widgets::{ColorWheel, CurveEditor, Slider};
 const APP_ID: &str = "io.github.vibinglut.VibingLUT";
 
 type Field = fn(&mut Params) -> &mut f32;
+
+/// What an export writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum What {
+    Grade,
+    /// The neutral LUT (e.g. a HALD to process in another editor).
+    Identity,
+    Lab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Grade,
+    Compare,
+    Lab,
+}
 
 #[derive(Debug)]
 enum Msg {
@@ -36,15 +55,23 @@ enum Msg {
     ResetAll,
     Compare(bool),
     Split(f32),
-    /// Format, lattice size, and whether to write the neutral (identity) LUT.
-    Export(Format, usize, bool),
-    ExportTo(Format, usize, bool, PathBuf),
+    Export(Format, usize, What),
+    ExportTo(Format, usize, What, PathBuf),
     ChooseFolder,
     Folder(PathBuf),
     GalleryLoaded(Vec<(String, Lut3d)>, Vec<String>),
     Group(u32),
     Preferences,
-    Page(bool),
+    Page(Page),
+    LabAdd(LabAdd),
+    OpenInLab,
+    LabLoaded(PathBuf, Result<Lut3d, String>),
+    LabRemove(usize),
+    LabMove(usize, bool),
+    LabIntensity(usize, f64),
+    LabProfile(usize, Profile),
+    LabInput(Profile),
+    LabBlend(Blend),
     Chart(bool),
     ChartReady(Profile, Photo),
     Profile(Profile),
@@ -67,6 +94,8 @@ struct Ui {
     groups: gtk::DropDown,
     prefs: adw::PreferencesDialog,
     prefs_row: adw::ActionRow,
+    lab: LabUi,
+    stack: adw::ViewStack,
     thumbs: Vec<gtk::Picture>,
     export: adw::SplitButton,
     chart_btn: gtk::ToggleButton,
@@ -78,12 +107,17 @@ struct App {
     compare: bool,
     split: f32,
     path: Option<PathBuf>,
-    lut_count: usize,
+    luts: Vec<Arc<Lut3d>>,
     /// Sub-folder of each LUT, and the distinct ones offered by the filter
     /// (filter index 0 = all, i = group_names[i - 1]).
     lut_groups: Vec<String>,
     group_names: Vec<String>,
-    on_compare: bool,
+    page: Page,
+    lab_layers: Vec<LabLayer>,
+    lab_input: Profile,
+    lab_blend: Blend,
+    /// Profile of the pixels currently on the GPU (photo or chart).
+    source_profile: Profile,
     profile: Profile,
     /// Last photo asked for (it may still be loading).
     requested: Option<PathBuf>,
@@ -124,6 +158,7 @@ impl App {
         let Some((img, profile)) = (if self.show_chart { &self.chart } else { &self.photo }) else { return };
         // The shader decodes the profile the pixels were actually encoded in.
         self.grade.params.set_input(*profile);
+        self.source_profile = *profile;
         let info = if self.show_chart { format!("Test chart · {}", profile.name()) } else { self.photo_info.clone() };
         self.ui.info.set_label(&info);
         self.send(Job::SetPhoto(img.clone()));
@@ -149,15 +184,55 @@ impl App {
     }
 
     fn render_gallery(&mut self) {
-        if self.has_source() && self.lut_count > 0 {
+        if self.has_source() && !self.luts.is_empty() {
             self.gallery_gen += 1;
             self.send(Job::Gallery(self.gallery_gen));
         }
     }
 
-    /// Renders only the view on screen; the other one refreshes when shown.
+    /// Renders only the view on screen; the others refresh when shown.
     fn refresh(&mut self) {
-        if self.on_compare { self.render_compare() } else { self.render() }
+        match self.page {
+            Page::Grade => self.render(),
+            Page::Compare => self.render_compare(),
+            Page::Lab => self.render_lab(),
+        }
+    }
+
+    fn lab_job_layers(&self) -> Vec<Layer> {
+        self.lab_layers
+            .iter()
+            .map(|l| {
+                let (source, input) = match &l.kind {
+                    LabKind::Lut(lut) => (Source::Lut(lut.clone()), l.input),
+                    LabKind::Grade => (Source::Grade(Box::new(self.grade.clone())), self.source_profile),
+                    LabKind::Convert(p) => (Source::Convert(*p), *p),
+                };
+                Layer { source, intensity: l.intensity, input }
+            })
+            .collect()
+    }
+
+    fn render_lab(&self) {
+        if self.has_source() && !self.lab_layers.is_empty() {
+            // The preview shows the stack on the current source, so its input is the source's profile.
+            let (input, layers, blend) = (self.source_profile, self.lab_job_layers(), self.lab_blend);
+            self.send(Job::Lab { input, layers, blend, split: self.split_value() });
+        }
+    }
+
+    fn push_lab_lut(&mut self, lut: Arc<Lut3d>, sender: &ComponentSender<Self>) {
+        // Vendors name the input in the file (e.g. "…_FLog_…"): preselect it.
+        let input = Profile::guess_from_name(&lut.title);
+        self.lab_layers.push(LabLayer { name: lut.title.clone(), kind: LabKind::Lut(lut), intensity: 1.0, input });
+        self.lab_changed(true, sender);
+    }
+
+    fn lab_changed(&mut self, structure: bool, sender: &ComponentSender<Self>) {
+        if structure {
+            self.ui.lab.rebuild(&self.lab_layers, self.source_profile, sender);
+        }
+        self.render_lab();
     }
 
     fn toast(&self, text: &str) {
@@ -591,7 +666,15 @@ impl SimpleComponent for App {
         folder_btn.connect_clicked(move |_| snd.input(Msg::ChooseFolder));
         let folder_row =
             gtk::Box::builder().spacing(6).margin_start(12).margin_end(8).margin_top(8).margin_bottom(4).build();
+        let to_lab = gtk::Button::builder()
+            .icon_name("view-list-symbolic")
+            .tooltip_text("Apri il LUT selezionato nel LUT Lab (per convertirlo o combinarlo)")
+            .css_classes(["flat"])
+            .build();
+        let snd = sender.clone();
+        to_lab.connect_clicked(move |_| snd.input(Msg::OpenInLab));
         folder_row.append(&folder_label);
+        folder_row.append(&to_lab);
         folder_row.append(&folder_btn);
         let groups = gtk::DropDown::builder().visible(false).margin_start(8).margin_end(8).margin_bottom(4).build();
         groups.update_property(&[gtk::accessible::Property::Label("Sottocartella")]);
@@ -648,9 +731,16 @@ impl SimpleComponent for App {
         let stack = adw::ViewStack::new();
         stack.add_titled_with_icon(&grade_split, Some("grade"), "Grade", "color-select-symbolic");
         stack.add_titled_with_icon(&compare_split, Some("compare"), "Confronta LUT", "view-grid-symbolic");
+        let lab = lab_page::build(&sender, &export_menu("lab-export", false));
+        stack.add_titled_with_icon(&lab.root, Some("lab"), "LUT Lab", "view-list-symbolic");
         let snd = sender.clone();
         stack.connect_visible_child_name_notify(move |s| {
-            snd.input(Msg::Page(s.visible_child_name().as_deref() == Some("compare")));
+            let page = match s.visible_child_name().as_deref() {
+                Some("compare") => Page::Compare,
+                Some("lab") => Page::Lab,
+                _ => Page::Grade,
+            };
+            snd.input(Msg::Page(page));
         });
 
         let header = adw::HeaderBar::new();
@@ -690,19 +780,7 @@ impl SimpleComponent for App {
                 .build(),
         );
 
-        let export_menu = gio::Menu::new();
-        let camera = gio::Menu::new();
-        camera.append(Some("Lumix · 33³ .cube"), Some("win.export::cube-33"));
-        camera.append(Some("Lumix / VariCam · 17³ .vlt"), Some("win.export::vlt-17"));
-        export_menu.append_section(Some("Fotocamera"), &camera);
-        let post = gio::Menu::new();
-        post.append(Some("Post-produzione · 65³ .cube"), Some("win.export::cube-65"));
-        post.append(Some("Alta precisione · 129³ .cube"), Some("win.export::cube-129"));
-        post.append(Some("HALD CLUT · 64³ .png"), Some("win.export::hald-64"));
-        export_menu.append_section(Some("Post-produzione"), &post);
-        let tools = gio::Menu::new();
-        tools.append(Some("HALD identità · .png"), Some("win.export::identity-64"));
-        export_menu.append_section(Some("Strumenti"), &tools);
+        let export_menu = export_menu("export", true);
         let export = adw::SplitButton::builder()
             .label("Esporta LUT")
             .menu_model(&export_menu)
@@ -711,7 +789,7 @@ impl SimpleComponent for App {
             .sensitive(false)
             .build();
         let snd = sender.clone();
-        export.connect_clicked(move |_| snd.input(Msg::Export(Format::Cube, 33, false)));
+        export.connect_clicked(move |_| snd.input(Msg::Export(Format::Cube, 33, What::Grade)));
         header.pack_end(&export);
 
         let compare_btn =
@@ -742,31 +820,46 @@ impl SimpleComponent for App {
         let bp = adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 900sp").expect("breakpoint"));
         bp.add_setter(&grade_split, "collapsed", Some(&true.to_value()));
         bp.add_setter(&compare_split, "collapsed", Some(&true.to_value()));
+        bp.add_setter(&lab.root, "collapsed", Some(&true.to_value()));
         bp.add_setter(&sidebar_btn, "visible", Some(&true.to_value()));
         bp.add_setter(&header, "title-widget", Some(&None::<gtk::Widget>.to_value()));
         bp.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
         window.add_breakpoint(bp);
 
         // ---------------- actions & shortcuts
-        let export_action = gio::SimpleAction::new("export", Some(glib::VariantTy::STRING));
+        for (name, what) in [("export", What::Grade), ("lab-export", What::Lab)] {
+            let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+            let snd = sender.clone();
+            action.connect_activate(move |_, v| {
+                // Target "<kind>-<size>", e.g. "vlt-17", "identity-64".
+                let Some(target) = v.and_then(|v| v.str().map(str::to_owned)) else { return };
+                let Some((kind, size)) = target.split_once('-') else { return };
+                let size = size.parse().unwrap_or(33);
+                let (format, what) = match kind {
+                    "vlt" => (Format::Vlt, what),
+                    "hald" => (Format::Hald, what),
+                    "identity" => (Format::Hald, What::Identity),
+                    _ => (Format::Cube, what),
+                };
+                snd.input(Msg::Export(format, size, what));
+            });
+            window.add_action(&action);
+        }
+        let lab_add = gio::SimpleAction::new("lab-add", Some(glib::VariantTy::STRING));
         let snd = sender.clone();
-        export_action.connect_activate(move |_, v| {
-            // Target "<kind>-<size>", e.g. "vlt-17", "identity-64".
-            let Some(target) = v.and_then(|v| v.str().map(str::to_owned)) else { return };
-            let Some((kind, size)) = target.split_once('-') else { return };
-            let size = size.parse().unwrap_or(33);
-            let (format, identity) = match kind {
-                "vlt" => (Format::Vlt, false),
-                "hald" => (Format::Hald, false),
-                "identity" => (Format::Hald, true),
-                _ => (Format::Cube, false),
+        lab_add.connect_activate(move |_, v| {
+            let add = match v.and_then(|v| v.str().map(str::to_owned)).as_deref() {
+                Some("selected") => LabAdd::Selected,
+                Some("file") => LabAdd::File,
+                Some("grade") => LabAdd::Grade,
+                _ => LabAdd::Convert,
             };
-            snd.input(Msg::Export(format, size, identity));
+            snd.input(Msg::LabAdd(add));
         });
-        window.add_action(&export_action);
+        window.add_action(&lab_add);
         let background =
             gio::SimpleAction::new_stateful("background", Some(glib::VariantTy::STRING), &"default".to_variant());
-        let canvases = [canvas.clone(), compare_canvas.clone()];
+        let canvases = [canvas.clone(), compare_canvas.clone(), lab.canvas.clone()];
         background.connect_change_state(move |a, v| {
             let Some(v) = v else { return };
             a.set_state(v);
@@ -874,10 +967,14 @@ impl SimpleComponent for App {
             compare: false,
             split: 0.5,
             path: None,
-            lut_count: 0,
+            luts: Vec::new(),
             lut_groups: Vec::new(),
             group_names: Vec::new(),
-            on_compare: false,
+            page: Page::Grade,
+            lab_layers: Vec::new(),
+            lab_input: Profile::Standard,
+            lab_blend: Blend::Chain,
+            source_profile: Profile::Standard,
             profile: Profile::Standard,
             requested: None,
             photo: None,
@@ -904,6 +1001,8 @@ impl SimpleComponent for App {
                 groups,
                 prefs,
                 prefs_row,
+                lab,
+                stack: stack.clone(),
                 thumbs: Vec::new(),
                 export,
                 chart_btn,
@@ -1018,14 +1117,15 @@ impl SimpleComponent for App {
                     self.refresh();
                 }
             }
-            Msg::Export(format, size, identity) => {
-                let stem = match (&self.path, identity) {
-                    (_, true) => format!("hald_identity_{size}"),
-                    (Some(p), false) => {
+            Msg::Export(format, size, what) => {
+                let stem = match (what, &self.path) {
+                    (What::Identity, _) => format!("hald_identity_{size}"),
+                    (What::Lab, _) => format!("lab_{}_{size}", self.lab_input.tag()),
+                    (What::Grade, Some(p)) => {
                         let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                         format!("{stem}_{}_{size}", self.profile.tag())
                     }
-                    (None, false) => format!("chart_{}_{size}", self.profile.tag()),
+                    (What::Grade, None) => format!("chart_{}_{size}", self.profile.tag()),
                 };
                 let label = format!("{} {size}³", format.badge());
                 let dialog = gtk::FileDialog::builder()
@@ -1037,22 +1137,33 @@ impl SimpleComponent for App {
                 let s = sender.clone();
                 dialog.save(Some(&self.ui.window), gio::Cancellable::NONE, move |r| {
                     if let Some(p) = r.ok().and_then(|f| f.path()) {
-                        s.input(Msg::ExportTo(format, size, identity, p));
+                        s.input(Msg::ExportTo(format, size, what, p));
                     }
                 });
             }
-            Msg::ExportTo(format, size, true, path) => {
-                // The neutral HALD needs no GPU: write it off the main thread.
-                let s = sender.input_sender().clone();
-                std::thread::spawn(move || {
-                    let r = Lut3d::identity(size, format).save(&path).map(|_| path);
-                    s.emit(Msg::Gpu(Done::Exported(r)));
-                });
-            }
-            Msg::ExportTo(format, size, false, path) => {
+            Msg::ExportTo(format, size, what, path) => {
                 let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let size = if format == Format::Vlt { VLT_SIZE } else { size };
-                self.send(Job::Export { grade: self.grade.clone(), size, format, title, path });
+                match what {
+                    What::Identity => {
+                        // The neutral LUT needs no GPU: write it off the main thread.
+                        let s = sender.input_sender().clone();
+                        std::thread::spawn(move || {
+                            let r = Lut3d::identity(size, format).save(&path).map(|_| path);
+                            s.emit(Msg::Gpu(Done::Exported(r)));
+                        });
+                    }
+                    What::Grade => self.send(Job::Export { grade: self.grade.clone(), size, format, title, path }),
+                    What::Lab => self.send(Job::ExportLab {
+                        input: self.lab_input,
+                        layers: self.lab_job_layers(),
+                        blend: self.lab_blend,
+                        size,
+                        format,
+                        title,
+                        path,
+                    }),
+                }
             }
             Msg::ChooseFolder => {
                 let dialog = gtk::FileDialog::builder().title("Cartella LUT").modal(true).build();
@@ -1114,7 +1225,6 @@ impl SimpleComponent for App {
                     self.ui.thumbs.push(pic);
                 }
                 self.ui.gallery_stack.set_visible_child_name(if luts.is_empty() { "empty" } else { "grid" });
-                self.lut_count = luts.len();
                 self.lut_groups = luts.iter().map(|(g, _)| g.clone()).collect();
                 self.group_names = self.lut_groups.clone();
                 self.group_names.dedup(); // sorted by group in core
@@ -1128,7 +1238,8 @@ impl SimpleComponent for App {
                 let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
                 self.ui.groups.set_model(Some(&gtk::StringList::new(&labels)));
                 self.ui.groups.set_visible(self.group_names.iter().any(|g| !g.is_empty()));
-                self.send(Job::SetLuts(luts.into_iter().map(|(_, l)| l).collect()));
+                self.luts = luts.into_iter().map(|(_, l)| Arc::new(l)).collect();
+                self.send(Job::SetLuts(self.luts.clone()));
                 self.selected = None;
                 self.ui.compare_stack.set_visible_child_name("empty");
                 self.render_gallery();
@@ -1147,7 +1258,7 @@ impl SimpleComponent for App {
             }
             Msg::Preferences => self.ui.prefs.present(Some(&self.ui.window)),
             Msg::SelectLut(i) => {
-                if i < self.lut_count && self.selected != Some(i) {
+                if i < self.luts.len() && self.selected != Some(i) {
                     self.selected = Some(i);
                     self.render_compare();
                 }
@@ -1182,8 +1293,95 @@ impl SimpleComponent for App {
                     }
                 }
             }
-            Msg::Page(compare) => {
-                self.on_compare = compare;
+            Msg::LabAdd(add) => match add {
+                LabAdd::Selected => match self.selected.and_then(|i| self.luts.get(i)) {
+                    Some(lut) => {
+                        let lut = lut.clone();
+                        self.push_lab_lut(lut, &sender);
+                    }
+                    None => self.toast("Seleziona prima un LUT in Confronta LUT"),
+                },
+                LabAdd::File => {
+                    let pats: Vec<String> = ["cube", "vlt", "png"].map(String::from).to_vec();
+                    let dialog = gtk::FileDialog::builder()
+                        .title("Aggiungi LUT")
+                        .filters(&file_filters("LUT (.cube, .vlt, HALD .png)", &pats))
+                        .modal(true)
+                        .build();
+                    let s = sender.clone();
+                    dialog.open(Some(&self.ui.window), gio::Cancellable::NONE, move |r| {
+                        let Some(p) = r.ok().and_then(|f| f.path()) else { return };
+                        let s = s.input_sender().clone();
+                        std::thread::spawn(move || {
+                            let lut = Lut3d::load(&p);
+                            s.emit(Msg::LabLoaded(p, lut));
+                        });
+                    });
+                }
+                LabAdd::Grade => {
+                    let layer = LabLayer {
+                        name: "Grade".into(),
+                        kind: LabKind::Grade,
+                        intensity: 1.0,
+                        input: self.source_profile,
+                    };
+                    self.lab_layers.push(layer);
+                    self.lab_changed(true, &sender);
+                }
+                LabAdd::Convert => {
+                    let layer = LabLayer {
+                        name: "Conversione".into(),
+                        kind: LabKind::Convert(Profile::Standard),
+                        intensity: 1.0,
+                        input: Profile::Standard,
+                    };
+                    self.lab_layers.push(layer);
+                    self.lab_changed(true, &sender);
+                }
+            },
+            Msg::OpenInLab => {
+                if self.selected.is_some() {
+                    self.ui.stack.set_visible_child_name("lab");
+                }
+                sender.input(Msg::LabAdd(LabAdd::Selected));
+            }
+            Msg::LabLoaded(_, Ok(lut)) => self.push_lab_lut(Arc::new(lut), &sender),
+            Msg::LabLoaded(p, Err(e)) => self.toast(&format!("Impossibile leggere {}: {e}", p.display())),
+            Msg::LabRemove(i) => {
+                if i < self.lab_layers.len() {
+                    self.lab_layers.remove(i);
+                    self.lab_changed(true, &sender);
+                }
+            }
+            Msg::LabMove(i, up) => {
+                let j = if up { i.checked_sub(1) } else { Some(i + 1) };
+                if let Some(j) = j.filter(|&j| j < self.lab_layers.len()) {
+                    self.lab_layers.swap(i, j);
+                    self.lab_changed(true, &sender);
+                }
+            }
+            Msg::LabIntensity(i, v) => {
+                if let Some(l) = self.lab_layers.get_mut(i) {
+                    l.intensity = (v / 100.0) as f32;
+                    self.lab_changed(false, &sender);
+                }
+            }
+            Msg::LabProfile(i, p) => {
+                if let Some(l) = self.lab_layers.get_mut(i) {
+                    match &mut l.kind {
+                        LabKind::Convert(to) => *to = p,
+                        _ => l.input = p,
+                    }
+                    self.lab_changed(false, &sender);
+                }
+            }
+            Msg::LabInput(p) => self.lab_input = p,
+            Msg::LabBlend(b) => {
+                self.lab_blend = b;
+                self.lab_changed(false, &sender);
+            }
+            Msg::Page(page) => {
+                self.page = page;
                 self.refresh();
             }
             Msg::Gpu(done) => self.on_gpu(done),
@@ -1203,6 +1401,7 @@ impl App {
                 w.set_paintable(Some(&texture(HIST_W as u32, HIST_H as u32, waveform)));
                 v.set_paintable(Some(&texture(VEC_SIZE as u32, VEC_SIZE as u32, vectorscope)));
             }
+            Done::Lab { width, height, rgba } => self.ui.lab.pic.set_paintable(Some(&texture(width, height, rgba))),
             Done::Compared { width, height, rgba } => {
                 self.ui.compare_pic.set_paintable(Some(&texture(width, height, rgba)));
                 self.ui.compare_stack.set_visible_child_name("image");
@@ -1232,6 +1431,28 @@ fn profile_hint(p: Profile) -> String {
     } else {
         "Segnale su cui il LUT verrà applicato (Photo Style Standard, Vivid…).".into()
     }
+}
+
+/// Menu of export formats for action `action` (`win.<action>::<kind>-<size>`).
+fn export_menu(action: &str, with_identity: bool) -> gio::Menu {
+    let item =
+        |m: &gio::Menu, label: &str, target: &str| m.append(Some(label), Some(&format!("win.{action}::{target}")));
+    let menu = gio::Menu::new();
+    let camera = gio::Menu::new();
+    item(&camera, "Lumix · 33³ .cube", "cube-33");
+    item(&camera, "Lumix / VariCam · 17³ .vlt", "vlt-17");
+    menu.append_section(Some("Fotocamera"), &camera);
+    let post = gio::Menu::new();
+    item(&post, "Post-produzione · 65³ .cube", "cube-65");
+    item(&post, "Alta precisione · 129³ .cube", "cube-129");
+    item(&post, "HALD CLUT · 64³ .png", "hald-64");
+    menu.append_section(Some("Post-produzione"), &post);
+    if with_identity {
+        let tools = gio::Menu::new();
+        item(&tools, "HALD identità · .png", "identity-64");
+        menu.append_section(Some("Strumenti"), &tools);
+    }
+    menu
 }
 
 fn wheel_mut(p: &mut Params, i: usize) -> &mut [f32; 4] {
