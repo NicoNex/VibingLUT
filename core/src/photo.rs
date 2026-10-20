@@ -3,11 +3,13 @@
 //! i.e. the same signal a camera "Standard" profile feeds into a LUT.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, Rgba32FImage};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
-use rawler::imgop::srgb::srgb_apply_gamma;
+pub use rawler::imgop::matrix::multiply_row1;
+pub use rawler::imgop::srgb::{srgb_apply_gamma, srgb_invert_gamma};
 
 use crate::profiles::Profile;
 
@@ -34,13 +36,58 @@ impl std::fmt::Debug for Photo {
     }
 }
 
+pub fn is_raw(path: &Path) -> bool {
+    path.extension().is_some_and(|e| RAW_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
+/// A decoded file, before it is expressed as a camera signal.
+#[derive(Clone, Debug)]
+pub enum Decoded {
+    /// JPEG/PNG/TIFF: already a camera signal (Standard, or e.g. a V-Log JPEG).
+    Raster(Arc<Photo>),
+    /// RAW: scene-linear Rec.709, so a profile change only re-encodes.
+    Raw(Arc<Photo>),
+}
+
+impl Decoded {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        if is_raw(path) {
+            load_raw(path).map(|p| Decoded::Raw(Arc::new(p)))
+        } else {
+            load_raster(path).map(|p| Decoded::Raster(Arc::new(p)))
+        }
+    }
+
+    /// The pixels as `profile`'s signal: RAWs are rendered into it, rasters
+    /// are taken as already encoded in it.
+    pub fn encode(&self, profile: Profile) -> Arc<Photo> {
+        match self {
+            Decoded::Raster(p) => p.clone(),
+            Decoded::Raw(scene) => {
+                let from709 = profile.from_rec709();
+                let pixels = scene
+                    .pixels
+                    .iter()
+                    .map(|p| {
+                        let s = [p[0], p[1], p[2]];
+                        let [r, g, b] = if profile.is_log() {
+                            multiply_row1(&from709, &s).map(|v| profile.encode(v))
+                        } else {
+                            view_transform(s)
+                        };
+                        [r, g, b, 1.0]
+                    })
+                    .collect();
+                Arc::new(Photo { width: scene.width, height: scene.height, pixels })
+            }
+        }
+    }
+}
+
 impl Photo {
-    /// Loads `path` as the signal `profile` describes. RAW files are rendered
-    /// into that signal; JPEG/PNG/TIFF are taken as already encoded in it
-    /// (e.g. a JPEG shot in V-Log).
-    pub fn load(path: &Path, profile: Profile) -> Result<Self, String> {
-        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if RAW_EXTS.contains(&ext.as_str()) { load_raw(path, profile) } else { load_raster(path) }
+    /// Loads `path` as the signal `profile` describes (see [`Decoded::encode`]).
+    pub fn load(path: &Path, profile: Profile) -> Result<Arc<Self>, String> {
+        Ok(Decoded::load(path)?.encode(profile))
     }
 
     /// Box-filtered copy that fits in `max` × `max`. Averages the stored
@@ -97,7 +144,8 @@ fn load_raster(path: &Path) -> Result<Photo, String> {
     Ok(Photo { width, height, pixels })
 }
 
-fn load_raw(path: &Path, profile: Profile) -> Result<Photo, String> {
+/// Scene-linear Rec.709 preview of a RAW.
+fn load_raw(path: &Path) -> Result<Photo, String> {
     let raw = rawler::decode_file(path).map_err(|e| e.to_string())?;
     // Everything but the final sRGB encode: we want linear camera-calibrated RGB.
     let dev = RawDevelop::new_with(&[
@@ -120,19 +168,9 @@ fn load_raw(path: &Path, profile: Profile) -> Result<Photo, String> {
     img.apply_orientation(orientation);
     let mut photo = Photo::from_image(img.into_rgba32f());
     for p in &mut photo.pixels {
-        let scene = [p[0], p[1], p[2]].map(|v| v * RAW_TO_SCENE);
-        let [r, g, b] = if profile.is_log() {
-            mat3(&profile.from_rec709(), scene).map(|v| profile.encode(v))
-        } else {
-            view_transform(scene)
-        };
-        *p = [r, g, b, 1.0];
+        *p = [p[0] * RAW_TO_SCENE, p[1] * RAW_TO_SCENE, p[2] * RAW_TO_SCENE, 1.0];
     }
     Ok(photo)
-}
-
-pub(crate) fn mat3(m: &[[f32; 3]; 3], c: [f32; 3]) -> [f32; 3] {
-    m.map(|row| row[0] * c[0] + row[1] * c[1] + row[2] * c[2])
 }
 
 /// Scene-linear scale of rawler output: Lumix RAWs sit ~0.8 EV under scene grey.
@@ -163,9 +201,4 @@ pub fn inverse_view_transform(display_linear: [f32; 3]) -> [f32; 3] {
     // m²/W² + m(1 − y) − y = 0
     let m = (-(1.0 - y) + ((1.0 - y) * (1.0 - y) + 4.0 * y / w2).sqrt()) * w2 / 2.0;
     display_linear.map(|v| v.max(0.0) / y * m / VIEW_EXPOSURE)
-}
-
-/// sRGB EOTF (inverse of `srgb_apply_gamma`).
-pub fn srgb_decode(v: f32) -> f32 {
-    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
 }

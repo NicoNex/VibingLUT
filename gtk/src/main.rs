@@ -14,9 +14,9 @@ use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk}
 use vibinglut_core::chart::test_chart;
 use vibinglut_core::gpu::{self, Done, Job};
 use vibinglut_core::grade::{Curve, Grade, Params};
-use vibinglut_core::lab::{Blend, Layer, Source};
-use vibinglut_core::lut::{Format, Lut3d, VLT_SIZE};
-use vibinglut_core::photo::{Photo, RASTER_EXTS, RAW_EXTS};
+use vibinglut_core::lab::{Blend, Layer, Source, Stack};
+use vibinglut_core::lut::{Format, Lut3d};
+use vibinglut_core::photo::{Decoded, Photo, RASTER_EXTS, RAW_EXTS};
 use vibinglut_core::profiles::Profile;
 use vibinglut_core::scopes::{HIST_H, HIST_W, Scopes, VEC_SIZE};
 use widgets::{ColorWheel, CurveEditor, Slider};
@@ -45,7 +45,9 @@ enum Page {
 enum Msg {
     Open,
     OpenPath(PathBuf),
-    Loaded(u64, PathBuf, Profile, Result<Photo, String>),
+    Loaded(u64, PathBuf, Result<Decoded, String>),
+    /// A RAW re-encoded for a profile: (load generation, profile, pixels).
+    Encoded(u64, Profile, Arc<Photo>),
     Set(Field, f64),
     Wheel(usize, f32, f32),
     WheelLuma(usize, f64),
@@ -73,7 +75,7 @@ enum Msg {
     LabInput(Profile),
     LabBlend(Blend),
     Chart(bool),
-    ChartReady(Profile, Photo),
+    ChartReady(Profile, Arc<Photo>),
     Profile(Profile),
     SelectLut(usize),
     Gpu(Done),
@@ -116,16 +118,13 @@ struct App {
     lab_layers: Vec<LabLayer>,
     lab_input: Profile,
     lab_blend: Blend,
-    /// Profile of the pixels currently on the GPU (photo or chart).
-    source_profile: Profile,
     profile: Profile,
-    /// Last photo asked for (it may still be loading).
-    requested: Option<PathBuf>,
-    /// Loaded photo and the profile it was encoded in; kept so the test
+    /// The open file, decoded once; `photo` is it encoded for a profile.
+    decoded: Option<Decoded>,
+    /// Shown source and the profile its pixels are encoded in; the test
     /// chart can be swapped in and out.
-    photo: Option<(Photo, Profile)>,
-    photo_info: String,
-    chart: Option<(Photo, Profile)>,
+    photo: Option<(Arc<Photo>, Profile)>,
+    chart: Option<(Arc<Photo>, Profile)>,
     show_chart: bool,
     selected: Option<usize>,
     jobs: mpsc::Sender<Job>,
@@ -149,13 +148,22 @@ impl App {
         }
     }
 
+    fn active(&self) -> Option<&(Arc<Photo>, Profile)> {
+        if self.show_chart { self.chart.as_ref() } else { self.photo.as_ref() }
+    }
+
     fn has_source(&self) -> bool {
-        if self.show_chart { self.chart.is_some() } else { self.photo.is_some() }
+        self.active().is_some()
+    }
+
+    /// Profile of the pixels currently shown (photo or chart).
+    fn source_profile(&self) -> Profile {
+        self.active().map_or(Profile::Standard, |s| s.1)
     }
 
     /// Sends the active source (photo or test chart) to the GPU and redraws.
     fn show_source(&mut self) {
-        let Some((img, profile)) = (if self.show_chart { &self.chart } else { &self.photo }) else {
+        let Some((img, profile)) = self.active().cloned() else {
             // Nothing to show (e.g. chart turned off with no photo open).
             self.ui.export.set_sensitive(false);
             self.ui.info.set_label("");
@@ -163,11 +171,13 @@ impl App {
             return;
         };
         // The shader decodes the profile the pixels were actually encoded in.
-        self.grade.params.set_input(*profile);
-        self.source_profile = *profile;
-        let info = if self.show_chart { format!("Test chart · {}", profile.name()) } else { self.photo_info.clone() };
-        self.ui.info.set_label(&info);
-        self.send(Job::SetPhoto(img.clone()));
+        self.grade.params.set_input(profile);
+        let name = match (&self.path, self.show_chart) {
+            (Some(p), false) => p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            _ => "Test chart".into(),
+        };
+        self.ui.info.set_label(&format!("{name} · {} · {}×{}", profile.name(), img.width, img.height));
+        self.send(Job::SetPhoto(img));
         self.sent = None;
         self.ui.export.set_sensitive(true);
         self.ui.grade_stack.set_visible_child_name("image");
@@ -211,7 +221,7 @@ impl App {
             .map(|l| {
                 let (source, input) = match &l.kind {
                     LabKind::Lut(lut) => (Source::Lut(lut.clone()), l.input),
-                    LabKind::Grade => (Source::Grade(Box::new(self.grade.clone())), self.source_profile),
+                    LabKind::Grade => (Source::Grade(Box::new(self.grade.clone())), self.source_profile()),
                     LabKind::Convert(p) => (Source::Convert(*p), *p),
                 };
                 Layer { source, intensity: l.intensity, input }
@@ -219,24 +229,48 @@ impl App {
             .collect()
     }
 
+    fn lab_stack(&self, input: Profile) -> Stack {
+        Stack { input, layers: self.lab_job_layers(), blend: self.lab_blend }
+    }
+
     fn render_lab(&self) {
         if self.has_source() && !self.lab_layers.is_empty() {
             // The preview shows the stack on the current source, so its input is the source's profile.
-            let (input, layers, blend) = (self.source_profile, self.lab_job_layers(), self.lab_blend);
-            self.send(Job::Lab { input, layers, blend, split: self.split_value() });
+            self.send(Job::Lab { stack: self.lab_stack(self.source_profile()), split: self.split_value() });
         }
+    }
+
+    /// Expresses the open file in the current profile: rasters are already
+    /// a signal, RAWs are re-encoded (off the main thread) without re-decoding.
+    fn encode_photo(&mut self, sender: &ComponentSender<Self>) {
+        match &self.decoded {
+            Some(Decoded::Raster(p)) => {
+                self.photo = Some((p.clone(), self.profile));
+                self.show_source();
+            }
+            Some(raw @ Decoded::Raw(_)) => {
+                let (raw, s, generation, profile) =
+                    (raw.clone(), sender.input_sender().clone(), self.load_gen, self.profile);
+                std::thread::spawn(move || s.emit(Msg::Encoded(generation, profile, raw.encode(profile))));
+            }
+            None => {}
+        }
+    }
+
+    fn push_layer(&mut self, kind: LabKind, input: Profile, sender: &ComponentSender<Self>) {
+        self.lab_layers.push(LabLayer { kind, intensity: 1.0, input });
+        self.lab_changed(true, sender);
     }
 
     fn push_lab_lut(&mut self, lut: Arc<Lut3d>, sender: &ComponentSender<Self>) {
         // Vendors name the input in the file (e.g. "…_FLog_…"): preselect it.
         let input = Profile::guess_from_name(&lut.title);
-        self.lab_layers.push(LabLayer { name: lut.title.clone(), kind: LabKind::Lut(lut), intensity: 1.0, input });
-        self.lab_changed(true, sender);
+        self.push_layer(LabKind::Lut(lut), input, sender);
     }
 
     fn lab_changed(&mut self, structure: bool, sender: &ComponentSender<Self>) {
         if structure {
-            self.ui.lab.rebuild(&self.lab_layers, self.source_profile, sender);
+            self.ui.lab.rebuild(&self.lab_layers, self.source_profile(), sender);
         }
         self.render_lab();
     }
@@ -399,8 +433,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
 
     // Input profile: the signal the LUT will receive in camera.
     let profile_box = vbox(6);
-    let names: Vec<&str> = Profile::ALL.iter().map(|p| p.name()).collect();
-    let profile_sel = gtk::DropDown::from_strings(&names);
+    let profile_sel = lab_page::profile_dropdown(Profile::Standard);
     profile_sel.update_property(&[gtk::accessible::Property::Label("Profilo di ingresso")]);
     let hint = gtk::Label::builder()
         .label(profile_hint(Profile::Standard))
@@ -980,11 +1013,9 @@ impl SimpleComponent for App {
             lab_layers: Vec::new(),
             lab_input: Profile::Standard,
             lab_blend: Blend::Chain,
-            source_profile: Profile::Standard,
             profile: Profile::Standard,
-            requested: None,
+            decoded: None,
             photo: None,
-            photo_info: String::new(),
             chart: None,
             show_chart: false,
             selected: None,
@@ -1043,37 +1074,38 @@ impl SimpleComponent for App {
             Msg::OpenPath(path) => {
                 self.ui.grade_stack.set_visible_child_name("loading");
                 self.load_gen += 1;
-                self.requested = Some(path.clone());
-                let (s, generation, profile) = (sender.input_sender().clone(), self.load_gen, self.profile);
+                let (s, generation) = (sender.input_sender().clone(), self.load_gen);
                 std::thread::spawn(move || {
-                    let r = Photo::load(&path, profile);
-                    s.emit(Msg::Loaded(generation, path, profile, r));
+                    let r = Decoded::load(&path);
+                    s.emit(Msg::Loaded(generation, path, r));
                 });
             }
             Msg::Loaded(generation, ..) if generation != self.load_gen => {}
-            Msg::Loaded(_, path, profile, Ok(photo)) => {
-                // Raster pixels don't depend on the profile, so take the current one
-                // (it may have changed while the file was loading).
-                let profile = if is_raw(&path) { profile } else { self.profile };
+            Msg::Loaded(_, path, Ok(decoded)) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.ui.window.set_title(Some(&format!("{name} — VibingLUT")));
-                self.photo_info = format!("{name} · {} · {}×{} anteprima", profile.name(), photo.width, photo.height);
-                // A new photo means you want to see it; a profile reload of the
-                // same one leaves the chart as it is.
-                let new_photo = self.path.as_ref() != Some(&path);
-                self.photo = Some((photo, profile));
+                self.decoded = Some(decoded);
                 self.path = Some(path);
-                if new_photo && self.show_chart {
+                // Opening a photo means you want to see it.
+                if self.show_chart {
                     self.show_chart = false;
                     self.ui.chart_btn.set_active(false);
                 }
-                self.show_source();
+                self.encode_photo(&sender);
             }
-            Msg::Loaded(_, path, _, Err(e)) => {
-                // Profile changes must keep reloading the photo that is actually shown.
-                self.requested = self.path.clone();
-                self.ui.grade_stack.set_visible_child_name(if self.path.is_some() { "image" } else { "empty" });
+            Msg::Loaded(_, path, Err(e)) => {
+                if !self.has_source() {
+                    self.ui.grade_stack.set_visible_child_name("empty");
+                } else {
+                    self.ui.grade_stack.set_visible_child_name("image");
+                }
                 self.toast(&format!("Impossibile aprire {}: {e}", path.display()));
+            }
+            Msg::Encoded(generation, profile, photo) => {
+                if generation == self.load_gen && profile == self.profile {
+                    self.photo = Some((photo, profile));
+                    self.show_source();
+                }
             }
             Msg::Set(field, v) => {
                 *field(&mut self.grade.params) = v as f32;
@@ -1161,7 +1193,6 @@ impl SimpleComponent for App {
             }
             Msg::ExportTo(format, size, what, path) => {
                 let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                let size = if format == Format::Vlt { VLT_SIZE } else { size };
                 match what {
                     What::Identity => {
                         // The neutral LUT needs no GPU: write it off the main thread.
@@ -1172,15 +1203,9 @@ impl SimpleComponent for App {
                         });
                     }
                     What::Grade => self.send(Job::Export { grade: self.grade.clone(), size, format, title, path }),
-                    What::Lab => self.send(Job::ExportLab {
-                        input: self.lab_input,
-                        layers: self.lab_job_layers(),
-                        blend: self.lab_blend,
-                        size,
-                        format,
-                        title,
-                        path,
-                    }),
+                    What::Lab => {
+                        self.send(Job::ExportLab { stack: self.lab_stack(self.lab_input), size, format, title, path })
+                    }
                 }
             }
             Msg::ChooseFolder => {
@@ -1283,40 +1308,19 @@ impl SimpleComponent for App {
             }
             Msg::Profile(profile) => {
                 self.profile = profile;
-                // RAWs are rendered into the profile's signal, so reload the photo
-                // (even one still loading, which was started with the old profile).
-                match self.requested.clone() {
-                    Some(path) if is_raw(&path) => sender.input(Msg::OpenPath(path)),
-                    // JPEG/PNG/TIFF pixels don't depend on the profile: just reinterpret them.
-                    _ => {
-                        if let Some((_, p)) = &mut self.photo {
-                            *p = profile;
-                        }
-                        if let Some(info) = self.photo_info.split(" · ").next().map(str::to_owned)
-                            && let Some((img, _)) = &self.photo
-                        {
-                            self.photo_info =
-                                format!("{info} · {} · {}×{} anteprima", profile.name(), img.width, img.height);
-                        }
-                        if !self.show_chart {
-                            self.show_source();
-                        }
-                    }
-                }
                 if self.show_chart {
                     sender.input(Msg::Chart(true));
                 }
+                self.encode_photo(&sender);
             }
             Msg::Chart(on) => {
                 self.show_chart = on;
-                match &self.chart {
-                    // The chart is encoded per profile; (re)build it off the main thread.
-                    _ if !on => self.show_source(),
-                    Some((_, p)) if *p == self.profile => self.show_source(),
-                    _ => {
-                        let (s, profile) = (sender.input_sender().clone(), self.profile);
-                        std::thread::spawn(move || s.emit(Msg::ChartReady(profile, test_chart(profile))));
-                    }
+                // The chart is encoded per profile; (re)build it off the main thread.
+                if !on || self.chart.as_ref().is_some_and(|c| c.1 == self.profile) {
+                    self.show_source();
+                } else {
+                    let (s, profile) = (sender.input_sender().clone(), self.profile);
+                    std::thread::spawn(move || s.emit(Msg::ChartReady(profile, Arc::new(test_chart(profile)))));
                 }
             }
             Msg::ChartReady(profile, chart) => {
@@ -1352,26 +1356,8 @@ impl SimpleComponent for App {
                         });
                     });
                 }
-                LabAdd::Grade => {
-                    let layer = LabLayer {
-                        name: "Grade".into(),
-                        kind: LabKind::Grade,
-                        intensity: 1.0,
-                        input: self.source_profile,
-                    };
-                    self.lab_layers.push(layer);
-                    self.lab_changed(true, &sender);
-                }
-                LabAdd::Convert => {
-                    let layer = LabLayer {
-                        name: "Conversione".into(),
-                        kind: LabKind::Convert(Profile::Standard),
-                        intensity: 1.0,
-                        input: Profile::Standard,
-                    };
-                    self.lab_layers.push(layer);
-                    self.lab_changed(true, &sender);
-                }
+                LabAdd::Grade => self.push_layer(LabKind::Grade, Profile::Standard, &sender),
+                LabAdd::Convert => self.push_layer(LabKind::Convert(Profile::Standard), Profile::Standard, &sender),
             },
             Msg::OpenInLab => {
                 if self.selected.is_some() {
@@ -1487,10 +1473,6 @@ fn export_menu(action: &str, with_identity: bool) -> gio::Menu {
         menu.append_section(Some("Strumenti"), &tools);
     }
     menu
-}
-
-fn is_raw(p: &std::path::Path) -> bool {
-    p.extension().is_some_and(|e| RAW_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
 }
 
 fn wheel_mut(p: &mut Params, i: usize) -> &mut [f32; 4] {

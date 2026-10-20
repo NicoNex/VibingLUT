@@ -177,16 +177,12 @@ impl Profile {
 
     /// Row-major camera-gamut → linear Rec.709 matrix.
     pub fn to_rec709(self) -> [[f32; 3]; 3] {
-        let (p, w) = self.gamut();
-        let m = mul(&inverse(&npm(REC709, D65)), &npm(p, w));
-        m.map(|r| r.map(|v| v as f32))
+        MATRICES[self as usize].0
     }
 
     /// Row-major linear Rec.709 → camera-gamut matrix.
     pub fn from_rec709(self) -> [[f32; 3]; 3] {
-        let (p, w) = self.gamut();
-        let m = mul(&inverse(&npm(p, w)), &npm(REC709, D65));
-        m.map(|r| r.map(|v| v as f32))
+        MATRICES[self as usize].1
     }
 
     /// Manufacturer OETF: scene-linear reflectance → full-range code value.
@@ -249,8 +245,7 @@ impl Profile {
             }
             Profile::LogC4 => {
                 let (a, b, c) = LOGC4;
-                let s = (7.0 * std::f64::consts::LN_2 * 2f64.powf(7.0 - 14.0 * c / b)) / (a * b);
-                let t = (2f64.powf(14.0 * (-c / b) + 6.0) - 64.0) / a;
+                let (s, t) = logc4_toe();
                 if l >= t { ((a * l + 64.0).log2() - 6.0) / 14.0 * b + c } else { (l - t) / s }
             }
             Profile::BmdFilmGen5 => {
@@ -347,8 +342,7 @@ impl Profile {
             }
             Profile::LogC4 => {
                 let (a, b, c) = LOGC4;
-                let s = (7.0 * std::f64::consts::LN_2 * 2f64.powf(7.0 - 14.0 * c / b)) / (a * b);
-                let t = (2f64.powf(14.0 * (-c / b) + 6.0) - 64.0) / a;
+                let (s, t) = logc4_toe();
                 if v >= 0.0 { (2f64.powf(14.0 * (v - c) / b + 6.0) - 64.0) / a } else { v * s + t }
             }
             Profile::BmdFilmGen5 => {
@@ -379,6 +373,26 @@ impl Profile {
         };
         l as f32
     }
+}
+
+/// (to Rec.709, from Rec.709) per profile, indexed by `Profile as usize`
+/// (declaration order = `Profile::ALL`). Derived once, in f64, from primaries.
+type M3f = [[f32; 3]; 3];
+static MATRICES: std::sync::LazyLock<[(M3f, M3f); 14]> = std::sync::LazyLock::new(|| {
+    Profile::ALL.map(|p| {
+        let (prim, w) = p.gamut();
+        let (cam, rec) = (npm(prim, w), npm(REC709, D65));
+        let f32m = |m: M3| m.map(|r| r.map(|v| v as f32));
+        (f32m(mul(&inverse(&rec), &cam)), f32m(mul(&inverse(&cam), &rec)))
+    })
+});
+
+/// LogC4 linear-toe slope and offset (s, t) from the ARRI spec.
+fn logc4_toe() -> (f64, f64) {
+    let (a, b, c) = LOGC4;
+    let s = (7.0 * std::f64::consts::LN_2 * 2f64.powf(7.0 - 14.0 * c / b)) / (a * b);
+    let t = (2f64.powf(14.0 * (-c / b) + 6.0) - 64.0) / a;
+    (s, t)
 }
 
 const LOGC4: (f64, f64, f64) = ((262144.0 - 16.0) / 117.45, (1023.0 - 95.0) / 1023.0, 95.0 / 1023.0);
@@ -465,6 +479,13 @@ mod tests {
                 let back = p.decode(p.encode(l));
                 assert!((back - l).abs() < 1e-3 * l.abs().max(1.0), "{p:?} {l}: {back}");
             }
+        }
+    }
+
+    #[test]
+    fn matrix_table_matches_declaration_order() {
+        for (i, p) in Profile::ALL.into_iter().enumerate() {
+            assert_eq!(p as usize, i, "MATRICES is indexed by declaration order");
         }
     }
 

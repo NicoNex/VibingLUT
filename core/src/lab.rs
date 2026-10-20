@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::grade::Grade;
 use crate::lut::{Format, Lut3d};
-use crate::photo::{inverse_view_transform, mat3, srgb_decode, view_transform};
+use crate::photo::{inverse_view_transform, multiply_row1, srgb_invert_gamma, view_transform};
 use crate::profiles::Profile;
 
 #[derive(Clone, Debug)]
@@ -54,12 +54,12 @@ pub fn convert(from: Profile, to: Profile, c: [f32; 3]) -> [f32; 3] {
         return c;
     }
     let scene = if from.is_log() {
-        mat3(&from.to_rec709(), c.map(|v| from.decode(v)))
+        multiply_row1(&from.to_rec709(), &c.map(|v| from.decode(v)))
     } else {
-        inverse_view_transform(c.map(srgb_decode))
+        inverse_view_transform(c.map(srgb_invert_gamma))
     };
     if to.is_log() {
-        mat3(&to.from_rec709(), scene).map(|v| to.encode(v).clamp(0.0, 1.0))
+        multiply_row1(&to.from_rec709(), &scene).map(|v| to.encode(v).clamp(0.0, 1.0))
     } else {
         view_transform(scene)
     }
@@ -84,18 +84,22 @@ impl Step {
     }
 }
 
-/// Composes `layers` into a `size`³ LUT whose input is `input`. `bake`
-/// turns a grade into a LUT (it runs on the GPU, unknown to this module).
-/// A chain ends in whatever profile its last step outputs. A mix blends the
-/// looks display-referred (Rec.709), then applies any conversion layers.
-pub fn compose(
-    input: Profile,
-    layers: &[Layer],
-    blend: Blend,
-    size: usize,
-    bake: &dyn Fn(&Grade) -> Arc<Lut3d>,
-) -> Lut3d {
-    let steps: Vec<Step> = layers
+/// A LUT Lab stack: layers, how they combine, and the camera signal the
+/// resulting LUT takes as input.
+#[derive(Clone, Debug, Default)]
+pub struct Stack {
+    pub input: Profile,
+    pub layers: Vec<Layer>,
+    pub blend: Blend,
+}
+
+/// Composes `stack` into a `size`³ LUT. `bake` turns a grade into a LUT (it
+/// runs on the GPU, unknown to this module). A chain ends in whatever profile
+/// its last step outputs. A mix blends the looks display-referred (Rec.709),
+/// then applies any conversion layers.
+pub fn compose(stack: &Stack, size: usize, bake: &dyn Fn(&Grade) -> Arc<Lut3d>) -> Lut3d {
+    let steps: Vec<Step> = stack
+        .layers
         .iter()
         .map(|l| {
             let w = l.intensity.clamp(0.0, 1.0);
@@ -108,13 +112,12 @@ pub fn compose(
             }
         })
         .collect();
+    let (input, blend) = (stack.input, stack.blend);
     let total: f32 = steps.iter().filter(|s| s.lut.is_some()).map(|s| s.weight).sum();
-    let mut out = Lut3d::identity(size, Format::Cube);
-    out.title = "VibingLUT Lab".into();
-    for c in &mut out.data {
-        *c = match blend {
+    let point = |c: [f32; 3]| {
+        match blend {
             Blend::Chain => {
-                let (mut v, mut at) = (*c, input);
+                let (mut v, mut at) = (c, input);
                 for s in &steps {
                     let y = s.apply(at, v);
                     // Fade against the neutral rendering in the output's own domain.
@@ -126,10 +129,10 @@ pub fn compose(
             Blend::Mix => {
                 // Weighted average of the looks; when the weights sum below 1
                 // the remainder is the neutral image, so a single layer fades.
-                let neutral = convert(input, Profile::Standard, *c);
+                let neutral = convert(input, Profile::Standard, c);
                 let mut v = if total > 0.0 {
                     let lab = steps.iter().filter(|s| s.lut.is_some()).fold([0.0; 3], |acc, s| {
-                        let l = to_oklab(convert(s.output, Profile::Standard, s.apply(input, *c)));
+                        let l = to_oklab(convert(s.output, Profile::Standard, s.apply(input, c)));
                         std::array::from_fn(|k| acc[k] + l[k] * s.weight / total)
                     });
                     mix_oklab(neutral, from_oklab(lab), total.min(1.0))
@@ -145,8 +148,18 @@ pub fn compose(
                 v
             }
         }
-        .map(|v| v.clamp(0.0, 1.0));
-    }
+        .map(|v| v.clamp(0.0, 1.0))
+    };
+    let mut out = Lut3d::identity(size, Format::Cube);
+    out.title = "VibingLUT Lab".into();
+    // Lattice points are independent: split them across the CPU cores.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let chunk = out.data.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for part in out.data.chunks_mut(chunk) {
+            scope.spawn(|| part.iter_mut().for_each(|c| *c = point(*c)));
+        }
+    });
     out
 }
 
@@ -164,7 +177,7 @@ fn mix_oklab(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 /// Display-encoded sRGB → OKLab (Ottosson's published constants, kept verbatim).
 #[allow(clippy::excessive_precision)]
 fn to_oklab(c: [f32; 3]) -> [f32; 3] {
-    let [r, g, b] = c.map(srgb_decode);
+    let [r, g, b] = c.map(srgb_invert_gamma);
     let lms = [
         0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b,
         0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b,
@@ -203,6 +216,10 @@ mod tests {
         unreachable!("no GPU sources in these tests")
     }
 
+    fn comp(input: Profile, layers: &[Layer], blend: Blend, size: usize) -> Lut3d {
+        compose(&Stack { input, layers: layers.to_vec(), blend }, size, &no_bake)
+    }
+
     fn warm() -> Arc<Lut3d> {
         let mut l = Lut3d::identity(17, Format::Cube);
         for c in &mut l.data {
@@ -220,16 +237,16 @@ mod tests {
         let id = Lut3d::identity(17, Format::Cube);
         let full = |w| vec![Layer { source: Source::Lut(warm()), intensity: w, input: Profile::Standard }];
         // Intensity 0 → identity; 1 → the LUT itself.
-        assert!(close(&compose(Profile::Standard, &full(0.0), Blend::Chain, 17, &no_bake), &id, 1e-4));
-        assert!(close(&compose(Profile::Standard, &full(1.0), Blend::Chain, 17, &no_bake), &warm(), 1e-4));
+        assert!(close(&comp(Profile::Standard, &full(0.0), Blend::Chain, 17), &id, 1e-4));
+        assert!(close(&comp(Profile::Standard, &full(1.0), Blend::Chain, 17), &warm(), 1e-4));
         // Mixing a LUT with itself gives the LUT, whatever the weights.
         let pair = vec![
             Layer { source: Source::Lut(warm()), intensity: 0.3, input: Profile::Standard },
             Layer { source: Source::Lut(warm()), intensity: 0.9, input: Profile::Standard },
         ];
-        assert!(close(&compose(Profile::Standard, &pair, Blend::Mix, 17, &no_bake), &warm(), 1e-3));
+        assert!(close(&comp(Profile::Standard, &pair, Blend::Mix, 17), &warm(), 1e-3));
         // Half intensity lands between identity and the LUT.
-        let half = compose(Profile::Standard, &full(0.5), Blend::Chain, 17, &no_bake);
+        let half = comp(Profile::Standard, &full(0.5), Blend::Chain, 17);
         let i = 8 + 17 * (8 + 17 * 8); // mid grey-ish lattice point
         assert!(half.data[i][0] > id.data[i][0] && half.data[i][0] < warm().data[i][0]);
     }
@@ -257,7 +274,7 @@ mod tests {
         // A LUT built for F-Log, used from V-Log: the result must equal
         // converting V-Log → F-Log by hand and sampling the LUT.
         let layers = [Layer { source: Source::Lut(warm()), intensity: 1.0, input: Profile::FLog }];
-        let out = compose(Profile::VLog, &layers, Blend::Chain, 9, &no_bake);
+        let out = comp(Profile::VLog, &layers, Blend::Chain, 9);
         let c = [0.5, 0.375, 0.25]; // lattice point (4, 3, 2) of a 9³ cube
         let want = warm().sample(convert(Profile::VLog, Profile::FLog, c));
         let got = out.data[4 + 9 * (3 + 9 * 2)];
@@ -285,7 +302,7 @@ mod tests {
         };
         let layers =
             [warm(), cool.clone()].map(|l| Layer { source: Source::Lut(l), intensity: 1.0, input: Profile::Standard });
-        let out = compose(Profile::Standard, &layers, Blend::Chain, 65, &no_bake);
+        let out = comp(Profile::Standard, &layers, Blend::Chain, 65);
         for c in [[0.13, 0.77, 0.4], [0.9, 0.05, 0.6], [0.5, 0.5, 0.5], [0.02, 0.3, 0.98]] {
             let want = cool.sample(warm().sample(c));
             let got = out.sample(c);
@@ -297,14 +314,14 @@ mod tests {
     fn mix_weights_are_normalised_and_symmetric() {
         let layer = |l: Arc<Lut3d>, w| Layer { source: Source::Lut(l), intensity: w, input: Profile::Standard };
         let id = Arc::new(Lut3d::identity(17, Format::Cube));
-        let mix = |layers: &[Layer]| compose(Profile::Standard, layers, Blend::Mix, 17, &no_bake);
+        let mix = |layers: &[Layer]| comp(Profile::Standard, layers, Blend::Mix, 17);
         // Once the weights reach 100%, only their ratio matters, not scale or order.
         let a = mix(&[layer(warm(), 0.6), layer(id.clone(), 0.6)]);
         let b = mix(&[layer(id.clone(), 0.9), layer(warm(), 0.9)]);
         assert!(close(&a, &b, 1e-5), "equal weights must not depend on scale or order");
         // Below 100% the rest is neutral: one layer at w equals the chain at w.
         let solo = mix(&[layer(warm(), 0.3)]);
-        let chain = compose(Profile::Standard, &[layer(warm(), 0.3)], Blend::Chain, 17, &no_bake);
+        let chain = comp(Profile::Standard, &[layer(warm(), 0.3)], Blend::Chain, 17);
         assert!(close(&solo, &chain, 1e-5));
         // A conversion layer in a mix re-encodes the mixed result.
         let conv = Layer { source: Source::Convert(Profile::VLog), intensity: 1.0, input: Profile::VLog };
@@ -324,7 +341,7 @@ mod tests {
         let lut = warm();
         let retarget = |size| {
             let layers = [Layer { source: Source::Lut(lut.clone()), intensity: 1.0, input: Profile::Standard }];
-            compose(Profile::VLog, &layers, Blend::Chain, size, &no_bake)
+            comp(Profile::VLog, &layers, Blend::Chain, size)
         };
         let err = |out: &Lut3d, c: [f32; 3]| {
             let via = out.sample(convert(Profile::Standard, Profile::VLog, c));

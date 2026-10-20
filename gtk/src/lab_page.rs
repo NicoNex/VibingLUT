@@ -22,7 +22,6 @@ pub enum LabKind {
 
 #[derive(Clone, Debug)]
 pub struct LabLayer {
-    pub name: String,
     pub kind: LabKind,
     pub intensity: f32,
     /// Signal the LUT expects (unused for grade and conversions).
@@ -37,6 +36,10 @@ pub enum LabAdd {
     Convert,
 }
 
+const CHAIN_HINT: &str = "Catena: i livelli si applicano uno dopo l'altro; l'intensità sfuma ogni passo.";
+const MIX_HINT: &str = "Miscela: ogni LUT riceve lo stesso ingresso; le uscite si mediano in OKLab con l'intensità come \
+     peso (sotto il 100% il resto è l'immagine neutra). Le conversioni si applicano al risultato.";
+
 pub struct LabUi {
     pub root: adw::OverlaySplitView,
     pub list: gtk::ListBox,
@@ -46,7 +49,7 @@ pub struct LabUi {
     pub export: adw::SplitButton,
 }
 
-fn profile_dropdown(selected: Profile) -> gtk::DropDown {
+pub(crate) fn profile_dropdown(selected: Profile) -> gtk::DropDown {
     let names: Vec<&str> = Profile::ALL.iter().map(|p| p.name()).collect();
     let d = gtk::DropDown::from_strings(&names);
     d.set_selected(Profile::ALL.iter().position(|p| *p == selected).unwrap_or(0) as u32);
@@ -78,18 +81,12 @@ pub fn build(sender: &ComponentSender<App>, export_menu: &gio::Menu) -> LabUi {
         "Segnale della camera su cui userai il LUT finale. Ogni livello riceve il segnale convertito nel suo profilo.",
     ));
 
-    let blend = adw::ToggleGroup::builder().css_classes(["round"]).homogeneous(true).build();
-    blend.add(adw::Toggle::builder().name("chain").label("Catena").build());
-    blend.add(adw::Toggle::builder().name("mix").label("Miscela").build());
-    let hint = caption("Catena: i livelli si applicano uno dopo l'altro; l'intensità sfuma ogni passo.");
+    let blend = crate::toggles(&[("chain", "Catena"), ("mix", "Miscela")]);
+    let hint = caption(CHAIN_HINT);
     let (snd, h) = (sender.clone(), hint.clone());
     blend.connect_active_name_notify(move |g| {
         let mix = g.active_name().as_deref() == Some("mix");
-        h.set_label(if mix {
-            "Miscela: ogni LUT riceve lo stesso ingresso; le uscite si mediano in OKLab con l'intensità come peso."
-        } else {
-            "Catena: i livelli si applicano uno dopo l'altro; l'intensità sfuma ogni passo."
-        });
+        h.set_label(if mix { MIX_HINT } else { CHAIN_HINT });
         snd.input(Msg::LabBlend(if mix { Blend::Mix } else { Blend::Chain }));
     });
     result.append(&blend);
@@ -181,7 +178,7 @@ impl LabUi {
             row.set_margin_end(6);
 
             let (kind, title) = match &l.kind {
-                LabKind::Lut(lut) => (lut.format.badge(), l.name.as_str()),
+                LabKind::Lut(lut) => (lut.format.badge(), lut.title.as_str()),
                 LabKind::Grade => ("GRADE", "Grade corrente"),
                 LabKind::Convert(_) => ("CONV", "Conversione"),
             };
@@ -196,7 +193,7 @@ impl LabUi {
                     .xalign(0.0)
                     .hexpand(true)
                     .css_classes(["heading"])
-                    .tooltip_text(&l.name)
+                    .tooltip_text(title)
                     .build(),
             );
             for (icon, tip, enabled, msg) in [
@@ -220,27 +217,22 @@ impl LabUi {
             }
             row.append(&head);
 
-            match &l.kind {
-                LabKind::Lut(_) => {
-                    let d = profile_dropdown(l.input);
-                    d.set_tooltip_text(Some("Profilo per cui è stato creato il LUT"));
+            let profile_row = match &l.kind {
+                LabKind::Lut(_) => Some(("Ingresso del LUT (profilo per cui è stato creato)", l.input)),
+                LabKind::Convert(p) => Some(("Converti il segnale in", *p)),
+                LabKind::Grade => None,
+            };
+            match profile_row {
+                Some((label, profile)) => {
+                    let d = profile_dropdown(profile);
                     let snd = sender.clone();
                     d.connect_selected_notify(move |d| {
-                        snd.input(Msg::LabProfile(i, Profile::ALL[d.selected() as usize]));
+                        snd.input(Msg::LabProfile(i, Profile::ALL[d.selected() as usize]))
                     });
-                    row.append(&caption("Ingresso del LUT"));
+                    row.append(&caption(label));
                     row.append(&d);
                 }
-                LabKind::Grade => row.append(&caption(&format!("Ingresso: {}", source_profile.name()))),
-                LabKind::Convert(p) => {
-                    let d = profile_dropdown(*p);
-                    let snd = sender.clone();
-                    d.connect_selected_notify(move |d| {
-                        snd.input(Msg::LabProfile(i, Profile::ALL[d.selected() as usize]));
-                    });
-                    row.append(&caption("Converti il segnale in"));
-                    row.append(&d);
-                }
+                None => row.append(&caption(&format!("Ingresso: {}", source_profile.name()))),
             }
             if !matches!(l.kind, LabKind::Convert(_)) {
                 let s = Slider::new("Intensità", 0.0, 100.0, 100.0, 0, None);

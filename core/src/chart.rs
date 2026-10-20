@@ -2,7 +2,7 @@
 //! every hue from highlight to shadow, and ColorChecker patches (skin tones
 //! included). Viewed through the same pipeline as a photo.
 
-use crate::photo::{Photo, inverse_view_transform, mat3, srgb_decode};
+use crate::photo::{Photo, inverse_view_transform, multiply_row1, srgb_invert_gamma};
 use crate::profiles::Profile;
 
 pub const WIDTH: u32 = 1536;
@@ -78,8 +78,8 @@ pub fn test_chart(profile: Profile) -> Photo {
         .map(|(x, y)| {
             let d = display((x as f32 + 0.5) / WIDTH as f32, (y as f32 + 0.5) / HEIGHT as f32);
             let [r, g, b] = if profile.is_log() {
-                let scene = inverse_view_transform(d.map(srgb_decode));
-                mat3(&from709, scene).map(|v| profile.encode(v))
+                let scene = inverse_view_transform(d.map(srgb_invert_gamma));
+                multiply_row1(&from709, &scene).map(|v| profile.encode(v))
             } else {
                 d
             };
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn log_chart_round_trips_through_the_view_transform() {
         for d in [[0.0, 0.0, 0.0], [0.5, 0.5, 0.5], [1.0, 1.0, 1.0], [0.9, 0.3, 0.1], [0.2, 0.4, 0.9]] {
-            let back = view_transform(inverse_view_transform(d.map(srgb_decode)));
+            let back = view_transform(inverse_view_transform(d.map(srgb_invert_gamma)));
             assert!((0..3).all(|k| (back[k] - d[k]).abs() < 2e-3), "{d:?} -> {back:?}");
         }
         assert_eq!(test_chart(Profile::Standard).pixels.len(), (WIDTH * HEIGHT) as usize);

@@ -35,6 +35,11 @@ impl Format {
         }
     }
 
+    /// Lattice size the format mandates, if any (VLT is always 17³).
+    pub fn fixed_size(self) -> Option<usize> {
+        (self == Format::Vlt).then_some(VLT_SIZE)
+    }
+
     /// Short label for UI badges.
     pub fn badge(self) -> &'static str {
         match self {
@@ -236,7 +241,7 @@ impl Lut3d {
     /// plus one message per file that failed to parse.
     pub fn load_dir(dir: &Path) -> (Vec<(String, Self)>, Vec<String>) {
         let mut paths = Vec::new();
-        collect_cubes(dir, &mut paths);
+        collect_luts(dir, &mut paths);
         let group = |p: &Path| {
             p.parent()
                 .and_then(|d| d.strip_prefix(dir).ok())
@@ -247,8 +252,12 @@ impl Lut3d {
         let (mut luts, mut errors) = (Vec::new(), Vec::new());
         for p in paths {
             let png = Format::from_path(&p) == Some(Format::Hald);
-            // A PNG next to a .cube/.vlt of the same name is that LUT's preview.
-            if png && ["cube", "vlt", "CUBE", "VLT"].iter().any(|e| p.with_extension(e).exists()) {
+            // A PNG beside a text LUT of the same name is that LUT's preview.
+            let text_lut_sibling = |q: &Path| {
+                q.file_stem() == p.file_stem() && matches!(Format::from_path(q), Some(Format::Cube | Format::Vlt))
+            };
+            let siblings = || p.parent().and_then(|d| std::fs::read_dir(d).ok());
+            if png && siblings().is_some_and(|mut rd| rd.any(|e| e.is_ok_and(|e| text_lut_sibling(&e.path())))) {
                 continue;
             }
             match Self::load(&p) {
@@ -278,7 +287,7 @@ fn looks_like_lattice(data: &[[f32; 3]], n: usize) -> bool {
 /// Recursive LUT search. Hidden entries are skipped and symlinked
 /// directories are not followed (`file_type` doesn't resolve links), so
 /// link cycles can't loop forever.
-fn collect_cubes(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+fn collect_luts(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let (path, Ok(ft)) = (e.path(), e.file_type()) else { continue };
@@ -286,7 +295,7 @@ fn collect_cubes(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
             continue;
         }
         if ft.is_dir() {
-            collect_cubes(&path, out);
+            collect_luts(&path, out);
         } else if match Format::from_path(&path) {
             Some(Format::Hald) => Lut3d::is_hald(&path),
             Some(_) => true,

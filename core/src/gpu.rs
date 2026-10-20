@@ -7,10 +7,9 @@ use std::sync::{Arc, mpsc};
 use wgpu::util::DeviceExt;
 
 use crate::grade::{CURVE_RES, Grade, Params};
-use crate::lab::{self, Blend, Layer};
+use crate::lab::{self, Stack};
 use crate::lut::{Format, Lut3d};
 use crate::photo::{Photo, THUMB_MAX};
-use crate::profiles::Profile;
 use crate::scopes::Scopes;
 
 pub struct Gpu {
@@ -202,7 +201,7 @@ impl Gpu {
 // ------------------------------------------------------------------ worker
 
 pub enum Job {
-    SetPhoto(Photo),
+    SetPhoto(Arc<Photo>),
     /// Uploads the comparison LUTs once; later jobs refer to them by index.
     SetLuts(Vec<Arc<Lut3d>>),
     Render(Grade, f32),
@@ -211,15 +210,11 @@ pub enum Job {
     Gallery(u64),
     /// Preview of a LUT Lab stack on the current photo.
     Lab {
-        input: Profile,
-        layers: Vec<Layer>,
-        blend: Blend,
+        stack: Stack,
         split: f32,
     },
     ExportLab {
-        input: Profile,
-        layers: Vec<Layer>,
-        blend: Blend,
+        stack: Stack,
         size: usize,
         format: Format,
         title: String,
@@ -268,6 +263,7 @@ pub enum Done {
 
 #[derive(Default)]
 struct Worker {
+    source: Option<Arc<Photo>>,
     photo: Option<GpuPhoto>,
     thumb: Option<GpuPhoto>,
     luts: Vec<GpuLut>,
@@ -290,8 +286,13 @@ impl Worker {
     fn handle(&mut self, gpu: &Gpu, job: Job, notify: &impl Fn(Done)) {
         match job {
             Job::SetPhoto(p) => {
+                // Same pixels (e.g. only the input profile changed): keep the upload.
+                if self.source.as_ref().is_some_and(|s| Arc::ptr_eq(s, &p)) {
+                    return;
+                }
                 self.thumb = Some(gpu.upload(&p.downscaled(THUMB_MAX)));
                 self.photo = Some(gpu.upload(&p));
+                self.source = Some(p);
             }
             Job::SetLuts(luts) => self.luts = luts.iter().map(|l| gpu.upload_lut(l)).collect(),
             Job::Render(grade, split) => {
@@ -312,18 +313,20 @@ impl Worker {
                     notify(Done::Thumb { generation, index, width: th.width, height: th.height, rgba });
                 }
             }
-            Job::Lab { input, layers, blend, split } => {
+            Job::Lab { stack, split } => {
                 let Some(ph) = &self.photo else { return };
                 // ponytail: 33³ preview lattice; exports compose at full size.
-                let lut = lab::compose(input, &layers, blend, 33, &|g| self.bake_cached(gpu, g));
+                let lut = lab::compose(&stack, 33, &|g| self.bake_cached(gpu, g));
                 let rgba = gpu.apply_lut(ph, &gpu.upload_lut(&lut), split);
                 notify(Done::Lab { width: ph.width, height: ph.height, rgba });
             }
-            Job::ExportLab { input, layers, blend, size, format, title, path } => {
-                let lut = lab::compose(input, &layers, blend, size, &|g| self.bake_cached(gpu, g));
+            Job::ExportLab { stack, size, format, title, path } => {
+                let size = format.fixed_size().unwrap_or(size);
+                let lut = lab::compose(&stack, size, &|g| self.bake_cached(gpu, g));
                 notify(Done::Exported(Lut3d { title, format, ..lut }.save(&path).map(|_| path)));
             }
             Job::Export { grade, size, format, title, path } => {
+                let size = format.fixed_size().unwrap_or(size);
                 let lut = Lut3d { format, ..gpu.bake(&grade, size, title) };
                 notify(Done::Exported(lut.save(&path).map(|_| path)));
             }
@@ -414,7 +417,7 @@ mod tests {
     /// profiles start from the same look and the decoders match the encoders.
     #[test]
     fn log_inputs_match_cpu_view_transform() {
-        use crate::photo::{mat3, view_transform};
+        use crate::photo::{multiply_row1, view_transform};
         use crate::profiles::Profile;
         let Ok(gpu) = Gpu::new() else { return eprintln!("no GPU, skipped") };
         let scene: Vec<[f32; 3]> = [0.0f32, 0.02, 0.09, 0.18, 0.36, 0.9, 2.0]
@@ -426,7 +429,7 @@ mod tests {
             let pixels = scene
                 .iter()
                 .map(|&c| {
-                    let [r, g, b] = mat3(&profile.from_rec709(), c).map(|v| profile.encode(v));
+                    let [r, g, b] = multiply_row1(&profile.from_rec709(), &c).map(|v| profile.encode(v));
                     [r, g, b, 1.0]
                 })
                 .collect();
