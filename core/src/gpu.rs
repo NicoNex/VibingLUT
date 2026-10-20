@@ -297,11 +297,30 @@ struct Worker {
     selected: Option<(PathBuf, GpuLut)>,
     /// Composite of the Grade page's look LUTs.
     look: Option<GpuLut>,
+    /// Thumbnail pass in progress: generation, LUT files, next index.
+    gallery: Option<(u64, Arc<Vec<PathBuf>>, usize)>,
     /// Last grade baked for the Lab, reused until the grade changes.
     grade_lut: std::cell::RefCell<Option<(Grade, Arc<Lut3d>)>>,
 }
 
 impl Worker {
+    /// Renders the next gallery thumbnail; false once the pass is done.
+    fn gallery_step(&mut self, gpu: &Gpu, notify: &impl Fn(Done)) -> bool {
+        let (Some((generation, paths, index)), Some(th)) = (&mut self.gallery, &self.thumb) else {
+            return false;
+        };
+        let (generation, i) = (*generation, *index);
+        *index += 1;
+        if let Some(Ok(lut)) = paths.get(i).map(|p| Lut3d::load(p)) {
+            let rgba = gpu.apply_lut(th, &gpu.upload_lut(&lut), 0.0);
+            notify(Done::Thumb { generation, index: i, width: th.width, height: th.height, rgba });
+        }
+        if i + 1 >= paths.len() {
+            self.gallery = None;
+        }
+        self.gallery.is_some()
+    }
+
     fn bake_cached(&self, gpu: &Gpu, g: &Grade) -> Arc<Lut3d> {
         if let Some((cached, lut)) = &*self.grade_lut.borrow()
             && cached == g
@@ -349,14 +368,8 @@ impl Worker {
                 let rgba = gpu.apply_lut(ph, lut, split);
                 notify(Done::Compared { width: ph.width, height: ph.height, rgba });
             }
-            Job::Gallery(generation, paths) => {
-                let Some(th) = &self.thumb else { return };
-                for (index, path) in paths.iter().enumerate() {
-                    let Ok(lut) = Lut3d::load(path) else { continue };
-                    let rgba = gpu.apply_lut(th, &gpu.upload_lut(&lut), 0.0);
-                    notify(Done::Thumb { generation, index, width: th.width, height: th.height, rgba });
-                }
-            }
+            // Rendered one thumbnail at a time by `gallery_step`, so previews never wait for a pass.
+            Job::Gallery(generation, paths) => self.gallery = Some((generation, paths, 0)),
             Job::Lab { stack, split } => {
                 let Some(ph) = &self.photo else { return };
                 // ponytail: 33³ preview lattice; exports compose at full size.
@@ -391,21 +404,30 @@ pub fn spawn(notify: impl Fn(Done) + Send + 'static) -> mpsc::Sender<Job> {
             };
             notify(Done::Ready(gpu.name.clone()));
             let mut worker = Worker::default();
-            while let Ok(first) = rx.recv() {
+            let mut thumbs_left = false;
+            loop {
+                // Block for work only when no thumbnail pass is pending.
+                let first = if thumbs_left {
+                    rx.try_recv().ok()
+                } else {
+                    match rx.recv() {
+                        Ok(job) => Some(job),
+                        Err(_) => return,
+                    }
+                };
                 // Keep only the newest job per slot, preserving order otherwise.
-                let mut batch: Vec<Job> = std::iter::once(first).chain(rx.try_iter()).collect();
+                let mut batch: Vec<Job> = first.into_iter().chain(rx.try_iter()).collect();
                 let mut seen = [false; 5];
                 batch.reverse();
                 batch.retain(|j| j.slot().is_none_or(|s| !std::mem::replace(&mut seen[s as usize], true)));
                 batch.reverse();
-                // Gallery passes are slow; run them after this batch's previews.
-                let (gallery, rest): (Vec<Job>, Vec<Job>) =
-                    batch.into_iter().partition(|j| j.slot() == Some(Slot::Gallery));
-                for job in rest.into_iter().chain(gallery) {
-                    // A device loss or validation error panics inside wgpu: report it instead of dying silently.
-                    if catch_unwind(AssertUnwindSafe(|| worker.handle(&gpu, job, &notify))).is_err() {
-                        return notify(Done::Failed("GPU error, restart the application".into()));
-                    }
+                // A device loss or validation error panics inside wgpu: report it instead of dying silently.
+                let ok = catch_unwind(AssertUnwindSafe(|| {
+                    batch.into_iter().for_each(|job| worker.handle(&gpu, job, &notify));
+                    thumbs_left = worker.gallery_step(&gpu, &notify);
+                }));
+                if ok.is_err() {
+                    return notify(Done::Failed("GPU error, restart the application".into()));
                 }
             }
         })

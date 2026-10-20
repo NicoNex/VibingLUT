@@ -12,6 +12,7 @@ mod settings;
 mod widgets;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 use gettextrs::gettext;
@@ -72,6 +73,8 @@ enum Msg {
     GalleryLoaded(Vec<LutEntry>, Vec<String>),
     Group(u32),
     Search(String),
+    /// Rescans the LUT folder.
+    Reload,
     /// A sidebar section switched off/on (`None` = the LUTs after the grade).
     Bypass(Option<Stage>, bool),
     Preferences,
@@ -439,6 +442,11 @@ fn section_with(title: &str, child: &impl IsA<gtk::Widget>, eye: Option<&gtk::To
     card.append(&top);
     card.append(&revealer);
     card
+}
+
+/// Where a file dialog opens: the remembered folder for `key`, if it still exists.
+fn start_in(key: &str) -> Option<gio::File> {
+    settings::folder(key).map(gio::File::for_path)
 }
 
 fn vbox(spacing: i32) -> gtk::Box {
@@ -820,7 +828,7 @@ fn empty_state(
 }
 
 impl SimpleComponent for App {
-    type Init = Option<PathBuf>;
+    type Init = ();
     type Input = Msg;
     type Output = ();
     type Root = adw::ApplicationWindow;
@@ -836,7 +844,7 @@ impl SimpleComponent for App {
             .build()
     }
 
-    fn init(init: Self::Init, window: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
+    fn init(_: Self::Init, window: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         // Neutral dark surround is the colourist standard.
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::PreferDark);
 
@@ -938,6 +946,14 @@ impl SimpleComponent for App {
         to_lab.connect_clicked(move |_| snd.input(Msg::OpenInLab));
         folder_row.append(&folder_label);
         folder_row.append(&to_lab);
+        let reload = gtk::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .tooltip_text(gettext("Reload folder"))
+            .css_classes(["flat"])
+            .build();
+        let snd = sender.clone();
+        reload.connect_clicked(move |_| snd.input(Msg::Reload));
+        folder_row.append(&reload);
         folder_row.append(&folder_btn);
         let groups = gtk::DropDown::builder().visible(false).margin_start(8).margin_end(8).margin_bottom(4).build();
         groups.update_property(&[gtk::accessible::Property::Label(&gettext("Subfolder"))]);
@@ -1306,10 +1322,8 @@ impl SimpleComponent for App {
                 chart_btn,
             },
         };
-        if let Some(p) = init {
-            sender.input(Msg::OpenPath(p));
-        }
-        if let Some(dir) = settings::lut_folder() {
+        OPEN.with(|o| o.set(sender.input_sender().clone()).ok());
+        if let Some(dir) = settings::folder(settings::LUT_FOLDER) {
             sender.input(Msg::Folder(dir));
         }
         ComponentParts { model, widgets: () }
@@ -1325,6 +1339,7 @@ impl SimpleComponent for App {
                     .filters(&file_filters(&gettext("Photos and RAWs"), &pats))
                     .modal(true)
                     .build();
+                dialog.set_initial_folder(start_in(settings::PHOTO_FOLDER).as_ref());
                 let s = sender.clone();
                 dialog.open(Some(&self.ui.window), gio::Cancellable::NONE, move |r| {
                     if let Some(p) = r.ok().and_then(|f| f.path()) {
@@ -1333,6 +1348,10 @@ impl SimpleComponent for App {
                 });
             }
             Msg::OpenPath(path) => {
+                // ponytail: a failed save only loses the dialog's start folder.
+                if let Some(dir) = path.parent() {
+                    let _ = settings::set_folder(settings::PHOTO_FOLDER, dir);
+                }
                 self.ui.grade_stack.set_visible_child_name("loading");
                 self.load_gen += 1;
                 let (s, generation) = (sender.input_sender().clone(), self.load_gen);
@@ -1484,6 +1503,7 @@ impl SimpleComponent for App {
             }
             Msg::ChooseFolder => {
                 let dialog = gtk::FileDialog::builder().title(gettext("LUT folder")).modal(true).build();
+                dialog.set_initial_folder(start_in(settings::LUT_FOLDER).as_ref());
                 let s = sender.clone();
                 dialog.select_folder(Some(&self.ui.window), gio::Cancellable::NONE, move |r| {
                     if let Some(p) = r.ok().and_then(|f| f.path()) {
@@ -1492,7 +1512,7 @@ impl SimpleComponent for App {
                 });
             }
             Msg::Folder(dir) => {
-                if let Err(e) = settings::set_lut_folder(&dir) {
+                if let Err(e) = settings::set_folder(settings::LUT_FOLDER, &dir) {
                     self.toast(&gettext!("Cannot save the LUT folder: {}", e));
                 }
                 self.ui.prefs_row.set_subtitle(&dir.to_string_lossy());
@@ -1582,6 +1602,10 @@ impl SimpleComponent for App {
                 self.looks_off = off;
                 self.layers_changed(Layers::Look, false, &sender);
             }
+            Msg::Reload => match settings::folder(settings::LUT_FOLDER) {
+                Some(dir) => sender.input(Msg::Folder(dir)),
+                None => sender.input(Msg::ChooseFolder),
+            },
             Msg::Search(text) => {
                 self.query = text.to_lowercase();
                 self.filter_gallery();
@@ -1636,6 +1660,7 @@ impl SimpleComponent for App {
                         .filters(&file_filters(&gettext("LUTs (.cube, .vlt, HALD .png)"), &pats))
                         .modal(true)
                         .build();
+                    dialog.set_initial_folder(start_in(settings::LUT_FOLDER).as_ref());
                     let s = sender.clone();
                     dialog.open(Some(&self.ui.window), gio::Cancellable::NONE, move |r| {
                         let Some(p) = r.ok().and_then(|f| f.path()) else { return };
@@ -1815,13 +1840,38 @@ fn locale_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/locale")))
 }
 
+thread_local! {
+    /// The window's input, for files opened through the application (see `main`).
+    static OPEN: std::cell::OnceCell<relm4::Sender<Msg>> = const { std::cell::OnceCell::new() };
+}
+
 fn main() {
     // gtk_init calls setlocale; a missing catalog just leaves the English source strings.
     let _ = gettextrs::bindtextdomain("vibinglut", locale_dir());
     let _ = gettextrs::bind_textdomain_codeset("vibinglut", "UTF-8");
     let _ = gettextrs::textdomain("vibinglut");
-    let file = std::env::args().nth(1).map(PathBuf::from);
-    let app = RelmApp::new(APP_ID).with_args(Vec::new());
-    relm4::set_global_css(&format!("{CSS}{}", band_css()));
-    app.run::<App>(file);
+    // HANDLES_OPEN: files from the command line or a file manager ("Open With")
+    // arrive here, also when VibingLUT is already running.
+    let app = adw::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
+    app.connect_open(|app, files, _| {
+        if let Some(p) = files.first().and_then(|f| f.path()) {
+            OPEN.with(|o| o.get().map(|s| s.emit(Msg::OpenPath(p))));
+        }
+        app.activate();
+    });
+    // When VibingLUT is already running this process only forwards the files,
+    // and RelmApp::run then blocks on one last main-loop iteration: keep waking
+    // the loop until we turn out to be the primary instance (startup).
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    app.connect_startup(|_| {
+        STARTED.store(true, Ordering::Relaxed);
+        relm4::set_global_css(&format!("{CSS}{}", band_css()));
+    });
+    std::thread::spawn(|| {
+        while !STARTED.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            glib::MainContext::default().wakeup();
+        }
+    });
+    RelmApp::from_app(app).with_args(std::env::args().collect()).run::<App>(());
 }

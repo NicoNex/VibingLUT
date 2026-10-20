@@ -9,5 +9,5 @@ Icon=io.github.vibinglut.VibingLUT
 Terminal=false
 Categories=Graphics;Photography;GTK;GNOME;
 Keywords=LUT;cube;color;grading;raw;lumix;
-MimeType=image/jpeg;image/png;image/tiff;image/x-panasonic-rw2;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-sony-arw;image/x-fuji-raf;image/x-olympus-orf;image/x-adobe-dng;
+MimeType=image/jpeg;image/png;image/tiff;image/x-adobe-dng;image/x-panasonic-rw2;image/x-panasonic-raw;image/x-panasonic-raw2;image/x-panasonic-rw;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-nikon-nrw;image/x-sony-arw;image/x-sony-sr2;image/x-sony-srf;image/x-fuji-raf;image/x-olympus-orf;image/x-pentax-pef;image/x-samsung-srw;image/x-phaseone-iiq;image/x-hasselblad-3fr;image/x-epson-erf;image/x-kodak-kdc;image/x-minolta-mrw;image/x-dcraw;
 StartupNotify=true
