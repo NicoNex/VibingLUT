@@ -1,5 +1,6 @@
 //! VibingLUT GTK4/libadwaita front-end over `vibinglut-core`.
 
+mod settings;
 mod widgets;
 
 use std::path::PathBuf;
@@ -37,7 +38,9 @@ enum Msg {
     ExportTo(usize, PathBuf),
     ChooseFolder,
     Folder(PathBuf),
-    GalleryLoaded(Vec<Lut3d>, Vec<String>),
+    GalleryLoaded(Vec<(String, Lut3d)>, Vec<String>),
+    Group(u32),
+    Preferences,
     Page(bool),
     Profile(Profile),
     SelectLut(usize),
@@ -56,6 +59,9 @@ struct Ui {
     compare_pic: gtk::Picture,
     flow: gtk::FlowBox,
     folder_label: gtk::Label,
+    groups: gtk::DropDown,
+    prefs: adw::PreferencesDialog,
+    prefs_row: adw::ActionRow,
     thumbs: Vec<gtk::Picture>,
     export: adw::SplitButton,
 }
@@ -67,6 +73,10 @@ struct App {
     split: f32,
     path: Option<PathBuf>,
     lut_count: usize,
+    /// Sub-folder of each LUT, and the distinct ones offered by the filter
+    /// (filter index 0 = all, i = group_names[i - 1]).
+    lut_groups: Vec<String>,
+    group_names: Vec<String>,
     on_compare: bool,
     profile: Profile,
     /// Last photo asked for (it may still be loading).
@@ -552,6 +562,10 @@ impl SimpleComponent for App {
             gtk::Box::builder().spacing(6).margin_start(12).margin_end(8).margin_top(8).margin_bottom(4).build();
         folder_row.append(&folder_label);
         folder_row.append(&folder_btn);
+        let groups = gtk::DropDown::builder().visible(false).margin_start(8).margin_end(8).margin_bottom(4).build();
+        groups.update_property(&[gtk::accessible::Property::Label("Sottocartella")]);
+        let snd = sender.clone();
+        groups.connect_selected_notify(move |d| snd.input(Msg::Group(d.selected())));
         let gallery_stack = gtk::Stack::new();
         gallery_stack.add_named(
             &adw::StatusPage::builder()
@@ -573,6 +587,7 @@ impl SimpleComponent for App {
         let gallery = vbox(0);
         gallery.add_css_class("sidebar-pane");
         gallery.append(&folder_row);
+        gallery.append(&groups);
         gallery.append(&gallery_stack);
 
         let compare_pic = gtk::Picture::builder()
@@ -624,6 +639,7 @@ impl SimpleComponent for App {
         bg_menu.append(Some("Bianco"), Some("win.background::white"));
         menu.append_section(Some("Sfondo anteprima"), &bg_menu);
         let section_menu = gio::Menu::new();
+        section_menu.append(Some("Preferenze"), Some("win.preferences"));
         section_menu.append(Some("Scorciatoie da tastiera"), Some("win.show-help-overlay"));
         section_menu.append(Some("Informazioni su VibingLUT"), Some("win.about"));
         menu.append_section(None, &section_menu);
@@ -720,6 +736,34 @@ impl SimpleComponent for App {
                 .present(Some(&w));
         });
         window.add_action(&about);
+        let prefs_action = gio::SimpleAction::new("preferences", None);
+        let snd = sender.clone();
+        prefs_action.connect_activate(move |_, _| snd.input(Msg::Preferences));
+        window.add_action(&prefs_action);
+        let prefs_btn = gtk::Button::builder()
+            .icon_name("folder-open-symbolic")
+            .tooltip_text("Scegli cartella")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        let snd = sender.clone();
+        prefs_btn.connect_clicked(move |_| snd.input(Msg::ChooseFolder));
+        let prefs_row = adw::ActionRow::builder()
+            .title("Cartella LUT")
+            .subtitle("Nessuna cartella")
+            .activatable_widget(&prefs_btn)
+            .build();
+        prefs_row.add_suffix(&prefs_btn);
+        let prefs_group = adw::PreferencesGroup::builder()
+            .title("Libreria LUT")
+            .description("I file .cube di questa cartella e delle sue sottocartelle compaiono in Confronta LUT.")
+            .build();
+        prefs_group.add(&prefs_row);
+        let prefs_page =
+            adw::PreferencesPage::builder().title("Generale").icon_name("preferences-system-symbolic").build();
+        prefs_page.add(&prefs_group);
+        let prefs = adw::PreferencesDialog::new();
+        prefs.add(&prefs_page);
         let help = gio::SimpleAction::new("show-help-overlay", None);
         let w = window.clone();
         help.connect_activate(move |_, _| shortcuts_dialog().present(Some(&w)));
@@ -747,6 +791,8 @@ impl SimpleComponent for App {
         let s = stack.clone();
         shortcut("<Alt>2", Box::new(move || s.set_visible_child_name("compare")));
         let w = window.clone();
+        let snd = sender.clone();
+        shortcut("<Control>comma", Box::new(move || snd.input(Msg::Preferences)));
         shortcut("<Control>question", Box::new(move || shortcuts_dialog().present(Some(&w))));
         window.add_controller(shortcuts);
 
@@ -770,6 +816,8 @@ impl SimpleComponent for App {
             split: 0.5,
             path: None,
             lut_count: 0,
+            lut_groups: Vec::new(),
+            group_names: Vec::new(),
             on_compare: false,
             profile: Profile::Standard,
             requested: None,
@@ -790,12 +838,18 @@ impl SimpleComponent for App {
                 compare_pic,
                 flow,
                 folder_label,
+                groups,
+                prefs,
+                prefs_row,
                 thumbs: Vec::new(),
                 export,
             },
         };
         if let Some(p) = init {
             sender.input(Msg::OpenPath(p));
+        }
+        if let Some(dir) = settings::lut_folder() {
+            sender.input(Msg::Folder(dir));
         }
         ComponentParts { model, widgets: () }
     }
@@ -938,6 +992,10 @@ impl SimpleComponent for App {
                 });
             }
             Msg::Folder(dir) => {
+                if let Err(e) = settings::set_lut_folder(&dir) {
+                    self.toast(&format!("Impossibile salvare la cartella LUT: {e}"));
+                }
+                self.ui.prefs_row.set_subtitle(&dir.to_string_lossy());
                 self.ui
                     .folder_label
                     .set_label(&dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
@@ -953,7 +1011,7 @@ impl SimpleComponent for App {
                 }
                 self.ui.flow.remove_all();
                 self.ui.thumbs.clear();
-                for lut in &luts {
+                for (group, lut) in &luts {
                     let pic = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).height_request(96).build();
                     let card = vbox(4);
                     card.add_css_class("thumb-card");
@@ -965,13 +1023,27 @@ impl SimpleComponent for App {
                             .css_classes(["caption"])
                             .build(),
                     );
-                    card.set_tooltip_text(Some(&format!("{} · {}³", lut.title, lut.size)));
+                    let place = if group.is_empty() { String::new() } else { format!("{group} · ") };
+                    card.set_tooltip_text(Some(&format!("{place}{} · {}³", lut.title, lut.size)));
                     self.ui.flow.append(&card);
                     self.ui.thumbs.push(pic);
                 }
                 self.ui.gallery_stack.set_visible_child_name(if luts.is_empty() { "empty" } else { "grid" });
                 self.lut_count = luts.len();
-                self.send(Job::SetLuts(luts));
+                self.lut_groups = luts.iter().map(|(g, _)| g.clone()).collect();
+                self.group_names = self.lut_groups.clone();
+                self.group_names.dedup(); // sorted by group in core
+                let labels: Vec<String> = std::iter::once("Tutte le cartelle".to_string())
+                    .chain(
+                        self.group_names
+                            .iter()
+                            .map(|g| if g.is_empty() { "Cartella principale".into() } else { g.clone() }),
+                    )
+                    .collect();
+                let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+                self.ui.groups.set_model(Some(&gtk::StringList::new(&labels)));
+                self.ui.groups.set_visible(self.group_names.iter().any(|g| !g.is_empty()));
+                self.send(Job::SetLuts(luts.into_iter().map(|(_, l)| l).collect()));
                 self.selected = None;
                 self.ui.compare_stack.set_visible_child_name("empty");
                 self.render_gallery();
@@ -979,6 +1051,16 @@ impl SimpleComponent for App {
                     self.ui.flow.select_child(&c);
                 }
             }
+            Msg::Group(sel) => {
+                // Index 0 shows everything; otherwise only LUTs of that sub-folder.
+                let want = (sel as usize).checked_sub(1).and_then(|i| self.group_names.get(i));
+                for (i, g) in self.lut_groups.iter().enumerate() {
+                    if let Some(c) = self.ui.flow.child_at_index(i as i32) {
+                        c.set_visible(want.is_none_or(|w| w == g));
+                    }
+                }
+            }
+            Msg::Preferences => self.ui.prefs.present(Some(&self.ui.window)),
             Msg::SelectLut(i) => {
                 if i < self.lut_count && self.selected != Some(i) {
                     self.selected = Some(i);
@@ -1066,6 +1148,7 @@ fn shortcuts_dialog() -> adw::ShortcutsDialog {
         ("Prima / dopo", "backslash"),
         ("Vista Grade", "<Alt>1"),
         ("Vista Confronta LUT", "<Alt>2"),
+        ("Preferenze", "<Control>comma"),
         ("Scorciatoie da tastiera", "<Control>question"),
     ] {
         section.add(adw::ShortcutsItem::new(title, accel));
