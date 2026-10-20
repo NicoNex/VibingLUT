@@ -6,7 +6,7 @@ pkgdesc="Color grade photos (JPEG/RAW) and export 3D LUTs (.cube), GPU accelerat
 arch=('x86_64' 'aarch64')
 license=('GPL-3.0-or-later')
 depends=('gtk4' 'libadwaita' 'vulkan-icd-loader')
-makedepends=('cargo')
+makedepends=('cargo' 'gettext')
 options=('!lto' '!debug')
 # Tarball produced by `make arch` from the committed HEAD.
 source=("$pkgname-$pkgver.tar.gz")

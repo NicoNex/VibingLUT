@@ -355,7 +355,10 @@ fn preview(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if idx >= p.width * p.height { return; }
     let c = src[idx].rgb;
-    dst_px[idx] = finish(idx, grade(c), c);
+    // Optional look LUT after the grade (lut_size 0 = none).
+    var g = grade(c);
+    if p.lut_size > 0u { g = tetrahedral(g); }
+    dst_px[idx] = finish(idx, g, c);
 }
 
 @compute @workgroup_size(256)

@@ -1,5 +1,12 @@
 //! VibingLUT GTK4/libadwaita front-end over `vibinglut-core`.
 
+/// `gettext` with `{}` placeholders filled in order (translations may not reorder them).
+macro_rules! gettext {
+    ($msgid:literal, $($arg:expr),+ $(,)?) => {
+        $crate::fill(&gettextrs::gettext($msgid), &[$($arg.to_string()),+])
+    };
+}
+
 mod lab_page;
 mod settings;
 mod widgets;
@@ -7,7 +14,8 @@ mod widgets;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
-use lab_page::{LabAdd, LabKind, LabLayer, LabUi};
+use gettextrs::gettext;
+use lab_page::{LabAdd, LabKind, LabLayer, LabUi, Layers};
 use relm4::adw::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk};
@@ -63,15 +71,16 @@ enum Msg {
     Folder(PathBuf),
     GalleryLoaded(Vec<LutEntry>, Vec<String>),
     Group(u32),
+    Search(String),
     Preferences,
     Page(Page),
-    LabAdd(LabAdd),
+    LayerAdd(Layers, LabAdd),
     OpenInLab,
-    LabLoaded(PathBuf, Result<Lut3d, String>),
-    LabRemove(usize),
-    LabMove(usize, bool),
-    LabIntensity(usize, f64),
-    LabProfile(usize, Profile),
+    LayerLoaded(Layers, PathBuf, Result<Lut3d, String>),
+    LayerRemove(Layers, usize),
+    LayerMove(Layers, usize, bool),
+    LayerIntensity(Layers, usize, f64),
+    LayerProfile(Layers, usize, Profile),
     LabInput(Profile),
     LabBlend(Blend),
     Chart(bool),
@@ -113,10 +122,14 @@ struct App {
     lut_paths: Arc<Vec<PathBuf>>,
     /// Sub-folder of each LUT, and the distinct ones offered by the filter
     /// (filter index 0 = all, i = group_names[i - 1]).
-    lut_groups: Vec<String>,
     group_names: Vec<String>,
+    /// Gallery filters: sub-folder (None = all) and lower-cased search text.
+    group: Option<String>,
+    query: String,
     page: Page,
     lab_layers: Vec<LabLayer>,
+    /// LUTs applied after the grade on the Grade page, baked into its export.
+    looks: Vec<LabLayer>,
     lab_input: Profile,
     lab_blend: Blend,
     profile: Profile,
@@ -145,7 +158,7 @@ impl App {
 
     fn send(&self, job: Job) {
         if self.jobs.send(job).is_err() {
-            self.toast("GPU non disponibile");
+            self.toast(&gettext("GPU unavailable"));
         }
     }
 
@@ -175,7 +188,7 @@ impl App {
         self.grade.params.set_input(profile);
         let name = match (&self.path, self.show_chart) {
             (Some(p), false) => p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            _ => "Test chart".into(),
+            _ => gettext("Test chart"),
         };
         self.ui.info.set_label(&format!("{name} · {} · {}×{}", profile.name(), img.width, img.height));
         self.send(Job::SetPhoto(img));
@@ -197,6 +210,18 @@ impl App {
     fn render_compare(&self) {
         if let (Some(i), true) = (self.selected, self.has_source()) {
             self.send(Job::ApplyLut(self.luts[i].path.clone(), self.split_value()));
+        }
+    }
+
+    fn filter_gallery(&self) {
+        for (i, l) in self.luts.iter().enumerate() {
+            if let Some(c) = self.ui.flow.child_at_index(i as i32) {
+                let in_group = self.group.as_ref().is_none_or(|g| *g == l.group);
+                let found = self.query.is_empty()
+                    || l.title.to_lowercase().contains(&self.query)
+                    || l.group.to_lowercase().contains(&self.query);
+                c.set_visible(in_group && found);
+            }
         }
     }
 
@@ -258,15 +283,59 @@ impl App {
         }
     }
 
-    fn push_layer(&mut self, kind: LabKind, input: Profile, sender: &ComponentSender<Self>) {
-        self.lab_layers.push(LabLayer { kind, intensity: 1.0, input });
-        self.lab_changed(true, sender);
+    fn layers_mut(&mut self, which: Layers) -> &mut Vec<LabLayer> {
+        match which {
+            Layers::Lab => &mut self.lab_layers,
+            Layers::Look => &mut self.looks,
+        }
     }
 
-    fn push_lab_lut(&mut self, lut: Arc<Lut3d>, sender: &ComponentSender<Self>) {
+    fn push_layer(&mut self, which: Layers, kind: LabKind, input: Profile, sender: &ComponentSender<Self>) {
+        self.layers_mut(which).push(LabLayer { kind, intensity: 1.0, input });
+        self.layers_changed(which, true, sender);
+    }
+
+    fn push_lut(&mut self, which: Layers, lut: Arc<Lut3d>, sender: &ComponentSender<Self>) {
         // Vendors name the input in the file (e.g. "…_FLog_…"): preselect it.
         let input = Profile::guess_from_name(&lut.title);
-        self.push_layer(LabKind::Lut(lut), input, sender);
+        self.push_layer(which, LabKind::Lut(lut), input, sender);
+    }
+
+    fn layers_changed(&mut self, which: Layers, structure: bool, sender: &ComponentSender<Self>) {
+        match which {
+            Layers::Lab => {
+                if !structure {
+                    self.ui.lab.refresh_summary(&self.lab_layers, self.lab_blend, self.lab_input);
+                }
+                self.lab_changed(structure, sender);
+            }
+            Layers::Look => {
+                if structure {
+                    lab_page::layer_rows(
+                        &self.ui.sidebar.looks,
+                        &self.looks,
+                        Layers::Look,
+                        self.source_profile(),
+                        sender,
+                    );
+                }
+                self.send(Job::SetLook(self.look_layers()));
+                self.sent = None;
+                self.render();
+            }
+        }
+    }
+
+    fn look_layers(&self) -> Vec<Layer> {
+        self.looks
+            .iter()
+            .filter_map(|l| match &l.kind {
+                LabKind::Lut(lut) => {
+                    Some(Layer { source: Source::Lut(lut.clone()), intensity: l.intensity, input: l.input })
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn lab_changed(&mut self, structure: bool, sender: &ComponentSender<Self>) {
@@ -387,7 +456,18 @@ flowboxchild:selected .thumb-card { background-color: color-mix(in srgb, var(--a
 "#;
 
 /// Selective-colour band names; their hues are `grade::BAND_HUES`.
-const BANDS: [&str; 8] = ["Rossi", "Arancioni", "Gialli", "Verdi", "Teal", "Blu", "Viola", "Magenta"];
+fn band_names() -> [String; 8] {
+    [
+        gettext("Reds"),
+        gettext("Oranges"),
+        gettext("Yellows"),
+        gettext("Greens"),
+        gettext("Teals"),
+        gettext("Blues"),
+        gettext("Purples"),
+        gettext("Magentas"),
+    ]
+}
 /// CSS class prefixes of the band's hue / saturation / luminance tracks.
 const BAND_TRACKS: [&str; 3] = ["hue", "sat", "lum"];
 
@@ -426,6 +506,7 @@ struct Sidebar {
     hue: [Slider; 3],
     curves: CurveEditor,
     scopes: [gtk::Picture; 3],
+    looks: gtk::ListBox,
 }
 
 fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
@@ -444,7 +525,11 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     for (pic, name) in scope_pics.iter().zip(["hist", "wave", "vec"]) {
         scope_stack.add_named(pic, Some(name));
     }
-    let scope_sel = toggles(&[("hist", "Istogramma"), ("wave", "Waveform"), ("vec", "Vettorscopio")]);
+    let scope_sel = toggles(&[
+        ("hist", gettext("Histogram").as_str()),
+        ("wave", gettext("Waveform").as_str()),
+        ("vec", gettext("Vectorscope").as_str()),
+    ]);
     let st = scope_stack.clone();
     scope_sel.connect_active_name_notify(move |g| {
         if let Some(n) = g.active_name() {
@@ -454,12 +539,12 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     let scopes_box = vbox(8);
     scopes_box.append(&scope_sel);
     scopes_box.append(&scope_stack);
-    panel.append(&section("Scope", &scopes_box));
+    panel.append(&section(&gettext("Scopes"), &scopes_box));
 
     // Input profile: the signal the LUT will receive in camera.
     let profile_box = vbox(6);
     let profile_sel = lab_page::profile_dropdown(Profile::Standard);
-    profile_sel.update_property(&[gtk::accessible::Property::Label("Profilo di ingresso")]);
+    profile_sel.update_property(&[gtk::accessible::Property::Label(&gettext("Input profile"))]);
     let hint = gtk::Label::builder()
         .label(profile_hint(Profile::Standard))
         .css_classes(["caption", "dim-label"])
@@ -474,7 +559,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     });
     profile_box.append(&profile_sel);
     profile_box.append(&hint);
-    panel.append(&section("Profilo di ingresso", &profile_box));
+    panel.append(&section(&gettext("Input profile"), &profile_box));
 
     let mut sliders = Vec::new();
     let mut add = |bx: &gtk::Box, label: &str, min: f64, max: f64, digits: u32, track: Option<&str>, field: Field| {
@@ -486,25 +571,25 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     };
 
     let wb = vbox(4);
-    add(&wb, "Temperatura", -100.0, 100.0, 0, Some("track-temp"), |p| &mut p.temperature);
-    add(&wb, "Tinta", -100.0, 100.0, 0, Some("track-tint"), |p| &mut p.tint);
-    panel.append(&section("Bilanciamento del bianco", &wb));
+    add(&wb, &gettext("Temperature"), -100.0, 100.0, 0, Some("track-temp"), |p| &mut p.temperature);
+    add(&wb, &gettext("Tint"), -100.0, 100.0, 0, Some("track-tint"), |p| &mut p.tint);
+    panel.append(&section(&gettext("White balance"), &wb));
 
     let tone = vbox(4);
-    add(&tone, "Esposizione", -3.0, 3.0, 2, None, |p| &mut p.exposure);
-    add(&tone, "Contrasto", -100.0, 100.0, 0, None, |p| &mut p.contrast);
-    add(&tone, "Alte luci", -100.0, 100.0, 0, None, |p| &mut p.highlights);
-    add(&tone, "Ombre", -100.0, 100.0, 0, None, |p| &mut p.shadows);
-    add(&tone, "Bianchi", -100.0, 100.0, 0, None, |p| &mut p.whites);
-    add(&tone, "Neri", -100.0, 100.0, 0, None, |p| &mut p.blacks);
-    panel.append(&section("Tono", &tone));
+    add(&tone, &gettext("Exposure"), -3.0, 3.0, 2, None, |p| &mut p.exposure);
+    add(&tone, &gettext("Contrast"), -100.0, 100.0, 0, None, |p| &mut p.contrast);
+    add(&tone, &gettext("Highlights"), -100.0, 100.0, 0, None, |p| &mut p.highlights);
+    add(&tone, &gettext("Shadows"), -100.0, 100.0, 0, None, |p| &mut p.shadows);
+    add(&tone, &gettext("Whites"), -100.0, 100.0, 0, None, |p| &mut p.whites);
+    add(&tone, &gettext("Blacks"), -100.0, 100.0, 0, None, |p| &mut p.blacks);
+    panel.append(&section(&gettext("Tone"), &tone));
 
     let color = vbox(4);
-    add(&color, "Saturazione", -100.0, 100.0, 0, None, |p| &mut p.saturation);
-    add(&color, "Vividezza", -100.0, 100.0, 0, None, |p| &mut p.vibrance);
-    add(&color, "Saturazione ombre", -100.0, 100.0, 0, None, |p| &mut p.sat_shadows);
-    add(&color, "Saturazione alte luci", -100.0, 100.0, 0, None, |p| &mut p.sat_highlights);
-    panel.append(&section("Colore", &color));
+    add(&color, &gettext("Saturation"), -100.0, 100.0, 0, None, |p| &mut p.saturation);
+    add(&color, &gettext("Vibrance"), -100.0, 100.0, 0, None, |p| &mut p.vibrance);
+    add(&color, &gettext("Shadow saturation"), -100.0, 100.0, 0, None, |p| &mut p.sat_shadows);
+    add(&color, &gettext("Highlight saturation"), -100.0, 100.0, 0, None, |p| &mut p.sat_highlights);
+    panel.append(&section(&gettext("Color"), &color));
 
     // Primaries: lift / gamma / gain / offset wheels with a master slider each.
     let wheels_row = gtk::Grid::builder().column_spacing(10).row_spacing(10).column_homogeneous(true).build();
@@ -522,15 +607,19 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
         wheels_row.attach(&col, (i % 2) as i32, (i / 2) as i32, 1, 1);
         wheels.push((wheel, luma));
     }
-    panel.append(&section("Ruote colore primarie", &wheels_row));
+    panel.append(&section(&gettext("Primary color wheels"), &wheels_row));
 
     // HSL mixer (OKLCh bands)
     let hsl = vbox(6);
-    let band_name = gtk::Label::builder().label(BANDS[0]).css_classes(["caption-heading"]).build();
+    let names = band_names();
+    let band_name = gtk::Label::builder().label(names[0].as_str()).css_classes(["caption-heading"]).build();
     let dots = gtk::Box::builder().spacing(6).halign(gtk::Align::Center).build();
     let mut first: Option<gtk::ToggleButton> = None;
-    for (i, name) in BANDS.iter().enumerate() {
-        let b = gtk::ToggleButton::builder().tooltip_text(*name).css_classes(["band", &format!("band-{i}")]).build();
+    for (i, name) in names.iter().enumerate() {
+        let b = gtk::ToggleButton::builder()
+            .tooltip_text(name.as_str())
+            .css_classes(["band", &format!("band-{i}")])
+            .build();
         b.update_property(&[gtk::accessible::Property::Label(name)]);
         match &first {
             None => {
@@ -539,10 +628,10 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
             }
             Some(f) => b.set_group(Some(f)),
         }
-        let (snd, bn) = (sender.clone(), band_name.clone());
+        let (snd, bn, name) = (sender.clone(), band_name.clone(), name.clone());
         b.connect_toggled(move |b| {
             if b.is_active() {
-                bn.set_label(BANDS[i]);
+                bn.set_label(&name);
                 snd.input(Msg::Band(i));
             }
         });
@@ -551,19 +640,24 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     hsl.append(&dots);
     hsl.append(&band_name);
     let hue: [Slider; 3] = std::array::from_fn(|k| {
-        let label = ["Tinta", "Saturazione", "Luminanza"][k];
-        let s = Slider::new(label, -100.0, 100.0, 0.0, 0, Some(&format!("{}-0", BAND_TRACKS[k])));
+        let label = [gettext("Hue"), gettext("Saturation"), gettext("Luminance")][k].clone();
+        let s = Slider::new(&label, -100.0, 100.0, 0.0, 0, Some(&format!("{}-0", BAND_TRACKS[k])));
         let snd = sender.clone();
         s.connect(move |v| snd.input(Msg::Hue(k, v)));
         hsl.append(&s.root);
         s
     });
-    panel.append(&section("Colori selettivi", &hsl));
+    panel.append(&section(&gettext("Selective color"), &hsl));
 
     // Curves
     let snd = sender.clone();
     let curves = CurveEditor::new(move |ch, c| snd.input(Msg::Curve(ch, c)));
-    let curve_sel = toggles(&[("0", "Luma"), ("1", "Rosso"), ("2", "Verde"), ("3", "Blu")]);
+    let curve_sel = toggles(&[
+        ("0", "Luma"),
+        ("1", gettext("Red").as_str()),
+        ("2", gettext("Green").as_str()),
+        ("3", gettext("Blue").as_str()),
+    ]);
     let ce = curves.clone();
     curve_sel.connect_active_name_notify(move |g| {
         if let Some(n) = g.active_name() {
@@ -571,7 +665,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
         }
     });
     let reset_curve =
-        gtk::Button::builder().label("Ripristina curva").css_classes(["flat"]).halign(gtk::Align::End).build();
+        gtk::Button::builder().label(gettext("Reset curve")).css_classes(["flat"]).halign(gtk::Align::End).build();
     let (ce, snd) = (curves.clone(), sender.clone());
     reset_curve.connect_clicked(move |_| {
         let (ch, c) = ce.reset_active();
@@ -582,16 +676,52 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     curve_box.append(&curves.area);
     curve_box.append(
         &gtk::Label::builder()
-            .label("Clic per aggiungere un punto, doppio clic o clic destro per rimuoverlo")
+            .label(gettext("Click to add a point, double-click or right-click to remove it"))
             .css_classes(["caption", "dim-label"])
             .wrap(true)
             .build(),
     );
     curve_box.append(&reset_curve);
-    panel.append(&section("Curve", &curve_box));
+    panel.append(&section(&gettext("Curves"), &curve_box));
+
+    // LUTs after the grade
+    let look_box = vbox(8);
+    let looks = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
+    looks.set_placeholder(Some(
+        &gtk::Label::builder()
+            .label(gettext("No LUTs: the grade is exported as is."))
+            .css_classes(["dim-label", "caption"])
+            .wrap(true)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build(),
+    ));
+    look_box.append(&looks);
+    let add_menu = gio::Menu::new();
+    add_menu.append(Some(gettext("LUT from file…").as_str()), Some("win.look-add::file"));
+    add_menu.append(Some(gettext("LUT selected in Compare").as_str()), Some("win.look-add::selected"));
+    look_box.append(
+        &gtk::MenuButton::builder()
+            .label(gettext("Add LUT"))
+            .menu_model(&add_menu)
+            .halign(gtk::Align::Start)
+            .css_classes(["pill"])
+            .build(),
+    );
+    look_box.append(
+        &gtk::Label::builder()
+            .label(gettext("Applied after the grade, top to bottom, and included in the exported LUT."))
+            .css_classes(["dim-label", "caption"])
+            .wrap(true)
+            .xalign(0.0)
+            .build(),
+    );
+    panel.append(&section(&gettext("LUTs"), &look_box));
 
     let reset = gtk::Button::builder()
-        .label("Ripristina tutto")
+        .label(gettext("Reset all"))
         .css_classes(["pill"])
         .halign(gtk::Align::Center)
         .margin_top(6)
@@ -606,7 +736,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
         .vexpand(true)
         .css_classes(["sidebar-pane"])
         .build();
-    Sidebar { scroll, sliders, wheels, hue, curves, scopes: scope_pics }
+    Sidebar { scroll, sliders, wheels, hue, curves, scopes: scope_pics, looks }
 }
 
 fn empty_state(
@@ -658,7 +788,7 @@ impl SimpleComponent for App {
             .hexpand(true)
             .vexpand(true)
             .build();
-        grade_pic.update_property(&[gtk::accessible::Property::Label("Anteprima del grade")]);
+        grade_pic.update_property(&[gtk::accessible::Property::Label(&gettext("Grade preview"))]);
         add_split_drag(&grade_pic, &sender);
         let info = gtk::Label::builder()
             .css_classes(["osd", "osd-info"])
@@ -677,7 +807,14 @@ impl SimpleComponent for App {
             .build();
         let grade_stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
         grade_stack.add_named(
-            &empty_state(&sender, "image-x-generic-symbolic", "Apri una foto", "Trascina qui un JPEG o un RAW della fotocamera, oppure scegli un file.\nIl grade diventa un LUT .cube per il profilo Standard.", "Apri foto…", || Msg::Open),
+            &empty_state(
+                &sender,
+                "image-x-generic-symbolic",
+                &gettext("Open a photo"),
+                &gettext("Drop a JPEG or camera RAW here, or choose a file.\nThe grade becomes a .cube LUT for the Standard profile."),
+                &gettext("Open Photo…"),
+                || Msg::Open,
+            ),
             Some("empty"),
         );
         grade_stack.add_named(&loading, Some("loading"));
@@ -715,7 +852,7 @@ impl SimpleComponent for App {
             }
         });
         let folder_label = gtk::Label::builder()
-            .label("Nessuna cartella")
+            .label(gettext("No folder"))
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .xalign(0.0)
             .hexpand(true)
@@ -723,7 +860,7 @@ impl SimpleComponent for App {
             .build();
         let folder_btn = gtk::Button::builder()
             .icon_name("folder-open-symbolic")
-            .tooltip_text("Scegli cartella LUT")
+            .tooltip_text(gettext("Choose LUT folder"))
             .css_classes(["flat"])
             .build();
         let snd = sender.clone();
@@ -732,7 +869,7 @@ impl SimpleComponent for App {
             gtk::Box::builder().spacing(6).margin_start(12).margin_end(8).margin_top(8).margin_bottom(4).build();
         let to_lab = gtk::Button::builder()
             .icon_name("view-list-symbolic")
-            .tooltip_text("Apri il LUT selezionato nel LUT Lab (per convertirlo o combinarlo)")
+            .tooltip_text(gettext("Open the selected LUT in LUT Lab (to convert or combine it)"))
             .css_classes(["flat"])
             .build();
         let snd = sender.clone();
@@ -741,15 +878,23 @@ impl SimpleComponent for App {
         folder_row.append(&to_lab);
         folder_row.append(&folder_btn);
         let groups = gtk::DropDown::builder().visible(false).margin_start(8).margin_end(8).margin_bottom(4).build();
-        groups.update_property(&[gtk::accessible::Property::Label("Sottocartella")]);
+        groups.update_property(&[gtk::accessible::Property::Label(&gettext("Subfolder"))]);
         let snd = sender.clone();
         groups.connect_selected_notify(move |d| snd.input(Msg::Group(d.selected())));
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text(gettext("Search LUTs"))
+            .margin_start(8)
+            .margin_end(8)
+            .margin_bottom(6)
+            .build();
+        let snd = sender.clone();
+        search.connect_search_changed(move |e| snd.input(Msg::Search(e.text().into())));
         let gallery_stack = gtk::Stack::new();
         gallery_stack.add_named(
             &adw::StatusPage::builder()
                 .icon_name("view-grid-symbolic")
-                .title("Nessun LUT")
-                .description("Scegli una cartella con file .cube")
+                .title(gettext("No LUTs"))
+                .description(gettext("Choose a folder with .cube files"))
                 .css_classes(["compact"])
                 .build(),
             Some("empty"),
@@ -766,6 +911,7 @@ impl SimpleComponent for App {
         gallery.add_css_class("sidebar-pane");
         gallery.append(&folder_row);
         gallery.append(&groups);
+        gallery.append(&search);
         gallery.append(&gallery_stack);
 
         let compare_pic = gtk::Picture::builder()
@@ -774,12 +920,19 @@ impl SimpleComponent for App {
             .hexpand(true)
             .vexpand(true)
             .build();
-        compare_pic.update_property(&[gtk::accessible::Property::Label("Anteprima del LUT selezionato")]);
+        compare_pic.update_property(&[gtk::accessible::Property::Label(&gettext("Selected LUT preview"))]);
         add_split_drag(&compare_pic, &sender);
         let compare_canvas = gtk::Overlay::builder().child(&compare_pic).css_classes(["canvas"]).build();
         let compare_stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
         compare_stack.add_named(
-            &empty_state(&sender, "view-grid-symbolic", "Confronta LUT", "Scegli una cartella di LUT .cube: ognuno viene applicato alla foto corrente con interpolazione tetraedrica sulla GPU.", "Scegli cartella…", || Msg::ChooseFolder),
+            &empty_state(
+                &sender,
+                "view-grid-symbolic",
+                &gettext("Compare LUTs"),
+                &gettext("Choose a folder of .cube LUTs: each one is applied to the current photo with tetrahedral interpolation on the GPU."),
+                &gettext("Choose Folder…"),
+                || Msg::ChooseFolder,
+            ),
             Some("empty"),
         );
         compare_stack.add_named(&compare_canvas, Some("image"));
@@ -794,7 +947,7 @@ impl SimpleComponent for App {
         // ---------------- view stack + header
         let stack = adw::ViewStack::new();
         stack.add_titled_with_icon(&grade_split, Some("grade"), "Grade", "color-select-symbolic");
-        stack.add_titled_with_icon(&compare_split, Some("compare"), "Confronta LUT", "view-grid-symbolic");
+        stack.add_titled_with_icon(&compare_split, Some("compare"), &gettext("Compare LUTs"), "view-grid-symbolic");
         let lab = lab_page::build(&sender, &export_menu("lab-export", false));
         stack.add_titled_with_icon(&lab.root, Some("lab"), "LUT Lab", "view-list-symbolic");
         let snd = sender.clone();
@@ -811,14 +964,16 @@ impl SimpleComponent for App {
         let switcher = adw::ViewSwitcher::builder().stack(&stack).policy(adw::ViewSwitcherPolicy::Wide).build();
         header.set_title_widget(Some(&switcher));
 
-        let open =
-            gtk::Button::builder().icon_name("document-open-symbolic").tooltip_text("Apri foto (Ctrl+O)").build();
+        let open = gtk::Button::builder()
+            .icon_name("document-open-symbolic")
+            .tooltip_text(gettext("Open Photo (Ctrl+O)"))
+            .build();
         let snd = sender.clone();
         open.connect_clicked(move |_| snd.input(Msg::Open));
         header.pack_start(&open);
         let chart_btn = gtk::ToggleButton::builder()
             .icon_name("applications-science-symbolic")
-            .tooltip_text("Test chart: mostra cosa fa il LUT a neutri, tinte e pelli (T)")
+            .tooltip_text(gettext("Test chart: shows what the LUT does to neutrals, hues and skin (T)"))
             .build();
         let snd = sender.clone();
         chart_btn.connect_toggled(move |b| snd.input(Msg::Chart(b.is_active())));
@@ -826,45 +981,47 @@ impl SimpleComponent for App {
 
         let menu = gio::Menu::new();
         let bg_menu = gio::Menu::new();
-        bg_menu.append(Some("Predefinito"), Some("win.background::default"));
-        bg_menu.append(Some("Nero"), Some("win.background::black"));
-        bg_menu.append(Some("Bianco"), Some("win.background::white"));
-        menu.append_section(Some("Sfondo anteprima"), &bg_menu);
+        bg_menu.append(Some(gettext("Default").as_str()), Some("win.background::default"));
+        bg_menu.append(Some(gettext("Black").as_str()), Some("win.background::black"));
+        bg_menu.append(Some(gettext("White").as_str()), Some("win.background::white"));
+        menu.append_section(Some(gettext("Preview background").as_str()), &bg_menu);
         let section_menu = gio::Menu::new();
-        section_menu.append(Some("Preferenze"), Some("win.preferences"));
-        section_menu.append(Some("Scorciatoie da tastiera"), Some("win.show-help-overlay"));
-        section_menu.append(Some("Informazioni su VibingLUT"), Some("win.about"));
+        section_menu.append(Some(gettext("Preferences").as_str()), Some("win.preferences"));
+        section_menu.append(Some(gettext("Keyboard Shortcuts").as_str()), Some("win.show-help-overlay"));
+        section_menu.append(Some(gettext("About VibingLUT").as_str()), Some("win.about"));
         menu.append_section(None, &section_menu);
         header.pack_end(
             &gtk::MenuButton::builder()
                 .icon_name("open-menu-symbolic")
                 .menu_model(&menu)
                 .primary(true)
-                .tooltip_text("Menu principale")
+                .tooltip_text(gettext("Main Menu"))
                 .build(),
         );
 
         let export_menu = export_menu("export", true);
         let export = adw::SplitButton::builder()
-            .label("Esporta LUT")
+            .label(gettext("Export LUT"))
             .menu_model(&export_menu)
             .css_classes(["suggested-action"])
-            .tooltip_text("Esporta .cube 33³ per Lumix (Ctrl+E)")
+            .tooltip_text(gettext("Export 33³ .cube for Lumix (Ctrl+E)"))
             .sensitive(false)
             .build();
         let snd = sender.clone();
         export.connect_clicked(move |_| snd.input(Msg::Export(Format::Cube, 33, What::Grade)));
         header.pack_end(&export);
 
-        let compare_btn =
-            gtk::ToggleButton::builder().icon_name("view-dual-symbolic").tooltip_text("Prima / dopo (\\)").build();
+        let compare_btn = gtk::ToggleButton::builder()
+            .icon_name("view-dual-symbolic")
+            .tooltip_text(gettext("Before / after (\\)"))
+            .build();
         let snd = sender.clone();
         compare_btn.connect_toggled(move |b| snd.input(Msg::Compare(b.is_active())));
         header.pack_end(&compare_btn);
 
         let sidebar_btn = gtk::ToggleButton::builder()
             .icon_name("sidebar-show-right-symbolic")
-            .tooltip_text("Mostra pannello")
+            .tooltip_text(gettext("Show panel"))
             .active(true)
             .visible(false)
             .build();
@@ -909,18 +1066,20 @@ impl SimpleComponent for App {
             });
             window.add_action(&action);
         }
-        let lab_add = gio::SimpleAction::new("lab-add", Some(glib::VariantTy::STRING));
-        let snd = sender.clone();
-        lab_add.connect_activate(move |_, v| {
-            let add = match v.and_then(|v| v.str().map(str::to_owned)).as_deref() {
-                Some("selected") => LabAdd::Selected,
-                Some("file") => LabAdd::File,
-                Some("grade") => LabAdd::Grade,
-                _ => LabAdd::Convert,
-            };
-            snd.input(Msg::LabAdd(add));
-        });
-        window.add_action(&lab_add);
+        for (name, which) in [("lab-add", Layers::Lab), ("look-add", Layers::Look)] {
+            let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+            let snd = sender.clone();
+            action.connect_activate(move |_, v| {
+                let add = match v.and_then(|v| v.str().map(str::to_owned)).as_deref() {
+                    Some("selected") => LabAdd::Selected,
+                    Some("file") => LabAdd::File,
+                    Some("grade") => LabAdd::Grade,
+                    _ => LabAdd::Convert,
+                };
+                snd.input(Msg::LayerAdd(which, add));
+            });
+            window.add_action(&action);
+        }
         let background =
             gio::SimpleAction::new_stateful("background", Some(glib::VariantTy::STRING), &"default".to_variant());
         let canvases = [canvas.clone(), compare_canvas.clone(), lab.canvas.clone()];
@@ -943,7 +1102,9 @@ impl SimpleComponent for App {
                 .application_name("VibingLUT")
                 .application_icon(APP_ID)
                 .version(env!("CARGO_PKG_VERSION"))
-                .comments("Color grading da foto e creazione di LUT 3D .cube, accelerato su GPU (Vulkan/Metal).")
+                .comments(gettext(
+                    "Color grading from photos and 3D .cube LUT creation, GPU accelerated (Vulkan/Metal).",
+                ))
                 .license_type(gtk::License::Gpl30)
                 .developer_name("Nicolò Santamaria")
                 .build()
@@ -956,25 +1117,25 @@ impl SimpleComponent for App {
         window.add_action(&prefs_action);
         let prefs_btn = gtk::Button::builder()
             .icon_name("folder-open-symbolic")
-            .tooltip_text("Scegli cartella")
+            .tooltip_text(gettext("Choose folder"))
             .valign(gtk::Align::Center)
             .css_classes(["flat"])
             .build();
         let snd = sender.clone();
         prefs_btn.connect_clicked(move |_| snd.input(Msg::ChooseFolder));
         let prefs_row = adw::ActionRow::builder()
-            .title("Cartella LUT")
-            .subtitle("Nessuna cartella")
+            .title(gettext("LUT folder"))
+            .subtitle(gettext("No folder"))
             .activatable_widget(&prefs_btn)
             .build();
         prefs_row.add_suffix(&prefs_btn);
         let prefs_group = adw::PreferencesGroup::builder()
-            .title("Libreria LUT")
-            .description("I file .cube di questa cartella e delle sue sottocartelle compaiono in Confronta LUT.")
+            .title(gettext("LUT library"))
+            .description(gettext("LUT files in this folder and its subfolders appear in Compare LUTs."))
             .build();
         prefs_group.add(&prefs_row);
         let prefs_page =
-            adw::PreferencesPage::builder().title("Generale").icon_name("preferences-system-symbolic").build();
+            adw::PreferencesPage::builder().title(gettext("General")).icon_name("preferences-system-symbolic").build();
         prefs_page.add(&prefs_group);
         let prefs = adw::PreferencesDialog::new();
         prefs.add(&prefs_page);
@@ -1006,6 +1167,14 @@ impl SimpleComponent for App {
         shortcut("<Alt>1", Box::new(move || s.set_visible_child_name("grade")));
         let s = stack.clone();
         shortcut("<Alt>2", Box::new(move || s.set_visible_child_name("compare")));
+        let (s, e) = (stack.clone(), search.clone());
+        shortcut(
+            "<Control>f",
+            Box::new(move || {
+                s.set_visible_child_name("compare");
+                e.grab_focus();
+            }),
+        );
         let w = window.clone();
         let snd = sender.clone();
         shortcut("<Control>comma", Box::new(move || snd.input(Msg::Preferences)));
@@ -1033,10 +1202,12 @@ impl SimpleComponent for App {
             path: None,
             luts: Vec::new(),
             lut_paths: Arc::default(),
-            lut_groups: Vec::new(),
             group_names: Vec::new(),
+            group: None,
+            query: String::new(),
             page: Page::Grade,
             lab_layers: Vec::new(),
+            looks: Vec::new(),
             lab_input: Profile::Standard,
             lab_blend: Blend::Chain,
             profile: Profile::Standard,
@@ -1086,8 +1257,8 @@ impl SimpleComponent for App {
                 // add_suffix matches case-insensitively.
                 let pats: Vec<String> = RASTER_EXTS.iter().chain(RAW_EXTS).map(|s| s.to_string()).collect();
                 let dialog = gtk::FileDialog::builder()
-                    .title("Apri foto")
-                    .filters(&file_filters("Foto e RAW", &pats))
+                    .title(gettext("Open Photo"))
+                    .filters(&file_filters(&gettext("Photos and RAWs"), &pats))
                     .modal(true)
                     .build();
                 let s = sender.clone();
@@ -1125,7 +1296,7 @@ impl SimpleComponent for App {
                 } else {
                     self.ui.grade_stack.set_visible_child_name("image");
                 }
-                self.toast(&format!("Impossibile aprire {}: {e}", path.display()));
+                self.toast(&gettext!("Cannot open {}: {}", path.display(), e));
             }
             Msg::Encoded(generation, profile, photo) => {
                 if generation == self.load_gen && profile == self.profile {
@@ -1153,7 +1324,7 @@ impl SimpleComponent for App {
                 for (k, (s, v)) in
                     self.ui.sidebar.hue.iter().zip([p.hue_shift[b], p.hue_sat[b], p.hue_lum[b]]).enumerate()
                 {
-                    for i in 0..BANDS.len() {
+                    for i in 0..BAND_HUES.len() {
                         s.scale.remove_css_class(&format!("{}-{i}", BAND_TRACKS[k]));
                     }
                     s.scale.add_css_class(&format!("{}-{b}", BAND_TRACKS[k]));
@@ -1211,7 +1382,7 @@ impl SimpleComponent for App {
                 };
                 let label = format!("{} {size}³", format.badge());
                 let dialog = gtk::FileDialog::builder()
-                    .title(format!("Esporta {label}"))
+                    .title(gettext!("Export {}", label))
                     .initial_name(format!("{stem}.{}", format.ext()))
                     .filters(&file_filters(&label, &[format.ext().into()]))
                     .modal(true)
@@ -1234,14 +1405,21 @@ impl SimpleComponent for App {
                             s.emit(Msg::Gpu(Done::Exported(r)));
                         });
                     }
-                    What::Grade => self.send(Job::Export { grade: self.grade.clone(), size, format, title, path }),
+                    What::Grade => self.send(Job::Export {
+                        grade: self.grade.clone(),
+                        look: self.look_layers(),
+                        size,
+                        format,
+                        title,
+                        path,
+                    }),
                     What::Lab => {
                         self.send(Job::ExportLab { stack: self.lab_stack(self.lab_input), size, format, title, path })
                     }
                 }
             }
             Msg::ChooseFolder => {
-                let dialog = gtk::FileDialog::builder().title("Cartella LUT").modal(true).build();
+                let dialog = gtk::FileDialog::builder().title(gettext("LUT folder")).modal(true).build();
                 let s = sender.clone();
                 dialog.select_folder(Some(&self.ui.window), gio::Cancellable::NONE, move |r| {
                     if let Some(p) = r.ok().and_then(|f| f.path()) {
@@ -1251,7 +1429,7 @@ impl SimpleComponent for App {
             }
             Msg::Folder(dir) => {
                 if let Err(e) = settings::set_lut_folder(&dir) {
-                    self.toast(&format!("Impossibile salvare la cartella LUT: {e}"));
+                    self.toast(&gettext!("Cannot save the LUT folder: {}", e));
                 }
                 self.ui.prefs_row.set_subtitle(&dir.to_string_lossy());
                 self.ui
@@ -1265,12 +1443,12 @@ impl SimpleComponent for App {
             }
             Msg::GalleryLoaded(luts, errors) => {
                 if !errors.is_empty() {
-                    self.toast(&format!("{} file ignorati: {}", errors.len(), errors.join("; ")));
+                    self.toast(&gettext!("{} files skipped: {}", errors.len(), errors.join("; ")));
                 }
                 self.ui.flow.remove_all();
                 self.ui.thumbs.clear();
                 if luts.len() >= MAX_LIBRARY {
-                    self.toast(&format!("Libreria molto grande: mostrati i primi {MAX_LIBRARY} LUT"));
+                    self.toast(&gettext!("Very large library: showing the first {} LUTs", MAX_LIBRARY));
                 }
                 for lut in &luts {
                     let pic = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).height_request(96).build();
@@ -1303,14 +1481,12 @@ impl SimpleComponent for App {
                     self.ui.thumbs.push(pic);
                 }
                 self.ui.gallery_stack.set_visible_child_name(if luts.is_empty() { "empty" } else { "grid" });
-                self.lut_groups = luts.iter().map(|l| l.group.clone()).collect();
-                self.group_names = self.lut_groups.clone();
+                self.group = None;
+                self.group_names = luts.iter().map(|l| l.group.clone()).collect();
                 self.group_names.dedup(); // sorted by group in core
-                let labels: Vec<String> = std::iter::once("Tutte le cartelle".to_string())
+                let labels: Vec<String> = std::iter::once(gettext("All folders"))
                     .chain(
-                        self.group_names
-                            .iter()
-                            .map(|g| if g.is_empty() { "Cartella principale".into() } else { g.clone() }),
+                        self.group_names.iter().map(|g| if g.is_empty() { gettext("Main folder") } else { g.clone() }),
                     )
                     .collect();
                 let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
@@ -1318,6 +1494,7 @@ impl SimpleComponent for App {
                 self.ui.groups.set_visible(self.group_names.iter().any(|g| !g.is_empty()));
                 self.lut_paths = Arc::new(luts.iter().map(|l| l.path.clone()).collect());
                 self.luts = luts;
+                self.filter_gallery();
                 self.selected = None;
                 self.ui.compare_stack.set_visible_child_name("empty");
                 self.render_gallery();
@@ -1327,12 +1504,12 @@ impl SimpleComponent for App {
             }
             Msg::Group(sel) => {
                 // Index 0 shows everything; otherwise only LUTs of that sub-folder.
-                let want = (sel as usize).checked_sub(1).and_then(|i| self.group_names.get(i));
-                for (i, g) in self.lut_groups.iter().enumerate() {
-                    if let Some(c) = self.ui.flow.child_at_index(i as i32) {
-                        c.set_visible(want.is_none_or(|w| w == g));
-                    }
-                }
+                self.group = (sel as usize).checked_sub(1).and_then(|i| self.group_names.get(i)).cloned();
+                self.filter_gallery();
+            }
+            Msg::Search(text) => {
+                self.query = text.to_lowercase();
+                self.filter_gallery();
             }
             Msg::Preferences => self.ui.prefs.present(Some(&self.ui.window)),
             Msg::SelectLut(i) => {
@@ -1366,22 +1543,22 @@ impl SimpleComponent for App {
                     }
                 }
             }
-            Msg::LabAdd(add) => match add {
+            Msg::LayerAdd(which, add) => match add {
                 LabAdd::Selected => match self.selected.and_then(|i| self.luts.get(i)) {
                     Some(entry) => {
                         let (p, s) = (entry.path.clone(), sender.input_sender().clone());
                         std::thread::spawn(move || {
                             let lut = Lut3d::load(&p);
-                            s.emit(Msg::LabLoaded(p, lut));
+                            s.emit(Msg::LayerLoaded(which, p, lut));
                         });
                     }
-                    None => self.toast("Seleziona prima un LUT in Confronta LUT"),
+                    None => self.toast(&gettext("Select a LUT in Compare LUTs first")),
                 },
                 LabAdd::File => {
                     let pats: Vec<String> = ["cube", "vlt", "png"].map(String::from).to_vec();
                     let dialog = gtk::FileDialog::builder()
-                        .title("Aggiungi LUT")
-                        .filters(&file_filters("LUT (.cube, .vlt, HALD .png)", &pats))
+                        .title(gettext("Add LUT"))
+                        .filters(&file_filters(&gettext("LUTs (.cube, .vlt, HALD .png)"), &pats))
                         .modal(true)
                         .build();
                     let s = sender.clone();
@@ -1390,49 +1567,49 @@ impl SimpleComponent for App {
                         let s = s.input_sender().clone();
                         std::thread::spawn(move || {
                             let lut = Lut3d::load(&p);
-                            s.emit(Msg::LabLoaded(p, lut));
+                            s.emit(Msg::LayerLoaded(which, p, lut));
                         });
                     });
                 }
-                LabAdd::Grade => self.push_layer(LabKind::Grade, Profile::Standard, &sender),
-                LabAdd::Convert => self.push_layer(LabKind::Convert(Profile::Standard), Profile::Standard, &sender),
+                LabAdd::Grade => self.push_layer(which, LabKind::Grade, Profile::Standard, &sender),
+                LabAdd::Convert => {
+                    self.push_layer(which, LabKind::Convert(Profile::Standard), Profile::Standard, &sender)
+                }
             },
             Msg::OpenInLab => {
                 if self.selected.is_some() {
                     self.ui.stack.set_visible_child_name("lab");
                 }
-                sender.input(Msg::LabAdd(LabAdd::Selected));
+                sender.input(Msg::LayerAdd(Layers::Lab, LabAdd::Selected));
             }
-            Msg::LabLoaded(_, Ok(lut)) => self.push_lab_lut(Arc::new(lut), &sender),
-            Msg::LabLoaded(p, Err(e)) => self.toast(&format!("Impossibile leggere {}: {e}", p.display())),
-            Msg::LabRemove(i) => {
-                if i < self.lab_layers.len() {
-                    self.lab_layers.remove(i);
-                    self.lab_changed(true, &sender);
+            Msg::LayerLoaded(which, _, Ok(lut)) => self.push_lut(which, Arc::new(lut), &sender),
+            Msg::LayerLoaded(_, p, Err(e)) => self.toast(&gettext!("Cannot read {}: {}", p.display(), e)),
+            Msg::LayerRemove(which, i) => {
+                if i < self.layers_mut(which).len() {
+                    self.layers_mut(which).remove(i);
+                    self.layers_changed(which, true, &sender);
                 }
             }
-            Msg::LabMove(i, up) => {
+            Msg::LayerMove(which, i, up) => {
                 let j = if up { i.checked_sub(1) } else { Some(i + 1) };
-                if let Some(j) = j.filter(|&j| j < self.lab_layers.len()) {
-                    self.lab_layers.swap(i, j);
-                    self.lab_changed(true, &sender);
+                if let Some(j) = j.filter(|&j| j < self.layers_mut(which).len()) {
+                    self.layers_mut(which).swap(i, j);
+                    self.layers_changed(which, true, &sender);
                 }
             }
-            Msg::LabIntensity(i, v) => {
-                if let Some(l) = self.lab_layers.get_mut(i) {
+            Msg::LayerIntensity(which, i, v) => {
+                if let Some(l) = self.layers_mut(which).get_mut(i) {
                     l.intensity = (v / 100.0) as f32;
-                    self.ui.lab.refresh_summary(&self.lab_layers, self.lab_blend, self.lab_input);
-                    self.lab_changed(false, &sender);
+                    self.layers_changed(which, false, &sender);
                 }
             }
-            Msg::LabProfile(i, p) => {
-                if let Some(l) = self.lab_layers.get_mut(i) {
+            Msg::LayerProfile(which, i, p) => {
+                if let Some(l) = self.layers_mut(which).get_mut(i) {
                     match &mut l.kind {
                         LabKind::Convert(to) => *to = p,
                         _ => l.input = p,
                     }
-                    self.ui.lab.refresh_summary(&self.lab_layers, self.lab_blend, self.lab_input);
-                    self.lab_changed(false, &sender);
+                    self.layers_changed(which, false, &sender);
                 }
             }
             Msg::LabInput(p) => {
@@ -1456,7 +1633,7 @@ impl App {
     fn on_gpu(&mut self, done: Done) {
         match done {
             Done::Ready(name) => self.toast(&format!("GPU: {name}")),
-            Done::Failed(e) => self.toast(&format!("GPU non disponibile: {e}")),
+            Done::Failed(e) => self.toast(&gettext!("GPU unavailable: {}", e)),
             Done::Graded { width, height, rgba, scopes: Scopes { histogram, waveform, vectorscope } } => {
                 self.ui.grade_pic.set_paintable(Some(&texture(width, height, rgba)));
                 let [h, w, v] = &self.ui.sidebar.scopes;
@@ -1478,21 +1655,18 @@ impl App {
                 }
             }
             Done::Exported(Ok(p)) => {
-                self.toast(&format!("LUT salvato: {}", p.file_name().unwrap_or_default().to_string_lossy()))
+                self.toast(&gettext!("LUT saved: {}", p.file_name().unwrap_or_default().to_string_lossy()))
             }
-            Done::Exported(Err(e)) => self.toast(&format!("Esportazione fallita: {e}")),
+            Done::Exported(Err(e)) => self.toast(&gettext!("Export failed: {}", e)),
         }
     }
 }
 
 fn profile_hint(p: Profile) -> String {
     if p.is_log() {
-        format!(
-            "LUT {} → Rec.709. I RAW vengono codificati in questo log; un JPEG/TIFF deve essere già in log.",
-            p.name()
-        )
+        gettext!("{} LUT → Rec.709. RAWs are encoded into this log; a JPEG/TIFF must already be in log.", p.name())
     } else {
-        "Segnale su cui il LUT verrà applicato (Photo Style Standard, Vivid…).".into()
+        gettext("Signal the LUT will be applied to (Photo Style Standard, Vivid…).")
     }
 }
 
@@ -1504,16 +1678,16 @@ fn export_menu(action: &str, with_identity: bool) -> gio::Menu {
     let camera = gio::Menu::new();
     item(&camera, "Lumix · 33³ .cube", "cube-33");
     item(&camera, "Lumix / VariCam · 17³ .vlt", "vlt-17");
-    menu.append_section(Some("Fotocamera"), &camera);
+    menu.append_section(Some(gettext("Camera").as_str()), &camera);
     let post = gio::Menu::new();
-    item(&post, "Post-produzione · 65³ .cube", "cube-65");
-    item(&post, "Alta precisione · 129³ .cube", "cube-129");
+    item(&post, &gettext("Post-production · 65³ .cube"), "cube-65");
+    item(&post, &gettext("High precision · 129³ .cube"), "cube-129");
     item(&post, "HALD CLUT · 64³ .png", "hald-64");
-    menu.append_section(Some("Post-produzione"), &post);
+    menu.append_section(Some(gettext("Post-production").as_str()), &post);
     if with_identity {
         let tools = gio::Menu::new();
-        item(&tools, "HALD identità · .png", "identity-64");
-        menu.append_section(Some("Strumenti"), &tools);
+        item(&tools, &gettext("HALD identity · .png"), "identity-64");
+        menu.append_section(Some(gettext("Tools").as_str()), &tools);
     }
     menu
 }
@@ -1531,22 +1705,46 @@ fn shortcuts_dialog() -> adw::ShortcutsDialog {
     let dialog = adw::ShortcutsDialog::new();
     let section = adw::ShortcutsSection::new(None);
     for (title, accel) in [
-        ("Apri foto", "<Control>o"),
-        ("Esporta LUT", "<Control>e"),
-        ("Prima / dopo", "backslash"),
-        ("Test chart", "t"),
-        ("Vista Grade", "<Alt>1"),
-        ("Vista Confronta LUT", "<Alt>2"),
-        ("Preferenze", "<Control>comma"),
-        ("Scorciatoie da tastiera", "<Control>question"),
+        (gettext("Open Photo"), "<Control>o"),
+        (gettext("Export LUT"), "<Control>e"),
+        (gettext("Before / after"), "backslash"),
+        (gettext("Test chart"), "t"),
+        (gettext("Grade view"), "<Alt>1"),
+        (gettext("Compare LUTs view"), "<Alt>2"),
+        (gettext("Search LUTs"), "<Control>f"),
+        (gettext("Preferences"), "<Control>comma"),
+        (gettext("Keyboard Shortcuts"), "<Control>question"),
     ] {
-        section.add(adw::ShortcutsItem::new(title, accel));
+        section.add(adw::ShortcutsItem::new(&title, accel));
     }
     dialog.add(section);
     dialog
 }
 
+fn fill(template: &str, args: &[String]) -> String {
+    let mut parts = template.split("{}");
+    let mut out = parts.next().unwrap_or_default().to_string();
+    for (part, arg) in parts.zip(args.iter().map(String::as_str).chain(std::iter::repeat(""))) {
+        out += arg;
+        out += part;
+    }
+    out
+}
+
+/// Installed: `<prefix>/bin/vibinglut` → `<prefix>/share/locale`; dev: `make` puts catalogs in `target/locale`.
+fn locale_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("share/locale")))
+        .filter(|d| d.join("it/LC_MESSAGES/vibinglut.mo").exists())
+        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/locale")))
+}
+
 fn main() {
+    // gtk_init calls setlocale; a missing catalog just leaves the English source strings.
+    let _ = gettextrs::bindtextdomain("vibinglut", locale_dir());
+    let _ = gettextrs::bind_textdomain_codeset("vibinglut", "UTF-8");
+    let _ = gettextrs::textdomain("vibinglut");
     let file = std::env::args().nth(1).map(PathBuf::from);
     let app = RelmApp::new(APP_ID).with_args(Vec::new());
     relm4::set_global_css(&format!("{CSS}{}", band_css()));

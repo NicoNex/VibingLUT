@@ -7,9 +7,10 @@ use std::sync::{Arc, mpsc};
 use wgpu::util::DeviceExt;
 
 use crate::grade::{CURVE_RES, Grade, Params};
-use crate::lab::{self, Stack};
+use crate::lab::{self, Blend, Layer, Source, Stack};
 use crate::lut::{Format, Lut3d};
 use crate::photo::{Photo, THUMB_MAX};
+use crate::profiles::Profile;
 use crate::scopes::Scopes;
 
 pub struct Gpu {
@@ -21,6 +22,8 @@ pub struct Gpu {
     /// Persistent uniforms, rewritten per frame with `queue.write_buffer`.
     params: wgpu::Buffer,
     curves: wgpu::Buffer,
+    /// Bound in place of a look LUT when there is none.
+    no_lut: wgpu::Buffer,
     pub name: String,
 }
 
@@ -30,7 +33,6 @@ pub struct GpuPhoto {
     src: wgpu::Buffer,
     out: wgpu::Buffer,
     staging: wgpu::Buffer,
-    preview_bind: wgpu::BindGroup,
     width: u32,
     height: u32,
 }
@@ -87,6 +89,7 @@ impl Gpu {
             bake: pipeline("bake"),
             params: uniform(std::mem::size_of::<Params>()),
             curves: uniform(4 * CURVE_RES * 4),
+            no_lut: uniform(16),
             name: format!("{} ({:?})", info.name, info.backend),
             device,
             queue,
@@ -131,8 +134,7 @@ impl Gpu {
     pub fn upload(&self, photo: &Photo) -> GpuPhoto {
         let src = self.storage(bytemuck::cast_slice(&photo.pixels));
         let (out, staging) = self.output(photo.width as u64 * photo.height as u64 * 4);
-        let preview_bind = self.bind(&self.preview, &[(0, &self.params), (1, &self.curves), (2, &src), (3, &out)]);
-        GpuPhoto { src, out, staging, preview_bind, width: photo.width, height: photo.height }
+        GpuPhoto { src, out, staging, width: photo.width, height: photo.height }
     }
 
     pub fn upload_lut(&self, lut: &Lut3d) -> GpuLut {
@@ -171,11 +173,14 @@ impl Gpu {
         bytes
     }
 
-    /// Graded preview as RGBA8.
-    pub fn render(&self, photo: &GpuPhoto, grade: &Grade, split: f32) -> Vec<u8> {
-        self.write_params(grade.params, photo.width, photo.height, 0, split);
+    /// Graded preview as RGBA8, optionally seen through a look LUT.
+    pub fn render(&self, photo: &GpuPhoto, grade: &Grade, look: Option<&GpuLut>, split: f32) -> Vec<u8> {
+        self.write_params(grade.params, photo.width, photo.height, look.map_or(0, |l| l.size), split);
         self.queue.write_buffer(&self.curves, 0, bytemuck::cast_slice(&grade.curve_samples()));
-        self.run(&self.preview, &photo.preview_bind, photo.width * photo.height, &photo.out, &photo.staging)
+        let lut = look.map_or(&self.no_lut, |l| &l.buf);
+        let bind = self
+            .bind(&self.preview, &[(0, &self.params), (1, &self.curves), (2, &photo.src), (3, &photo.out), (5, lut)]);
+        self.run(&self.preview, &bind, photo.width * photo.height, &photo.out, &photo.staging)
     }
 
     /// Photo seen through an external LUT (tetrahedral), as RGBA8.
@@ -198,10 +203,28 @@ impl Gpu {
     }
 }
 
+impl Gpu {
+    /// The grade followed by `look` (chained, as on the Grade page) on an N³ lattice.
+    pub fn bake_with_look(&self, grade: Grade, look: Vec<Layer>, size: usize, title: String) -> Lut3d {
+        let baked = self.bake(&grade, size, title.clone());
+        if look.is_empty() {
+            return baked;
+        }
+        // Grade baked on the export lattice itself, so its nodes are exact.
+        let baked = Arc::new(baked);
+        let grade = Layer { source: Source::Grade(Box::new(grade)), intensity: 1.0, input: Profile::Standard };
+        let layers = std::iter::once(grade).chain(look).collect();
+        let stack = Stack { input: Profile::Standard, layers, blend: Blend::Chain };
+        Lut3d { title, ..lab::compose(&stack, size, &|_| baked.clone()) }
+    }
+}
+
 // ------------------------------------------------------------------ worker
 
 pub enum Job {
     SetPhoto(Arc<Photo>),
+    /// LUTs applied after the grade on the Grade page (empty = none).
+    SetLook(Vec<Layer>),
     Render(Grade, f32),
     /// The photo through the LUT file at `path` (kept on the GPU while selected).
     ApplyLut(PathBuf, f32),
@@ -220,8 +243,10 @@ pub enum Job {
         title: String,
         path: PathBuf,
     },
+    /// The grade followed by its look LUTs.
     Export {
         grade: Grade,
+        look: Vec<Layer>,
         size: usize,
         format: Format,
         title: String,
@@ -235,6 +260,7 @@ enum Slot {
     Compare,
     Gallery,
     Lab,
+    Look,
 }
 
 impl Job {
@@ -245,6 +271,7 @@ impl Job {
             Job::ApplyLut(..) => Some(Slot::Compare),
             Job::Gallery(..) => Some(Slot::Gallery),
             Job::Lab { .. } => Some(Slot::Lab),
+            Job::SetLook(..) => Some(Slot::Look),
             _ => None,
         }
     }
@@ -268,6 +295,8 @@ struct Worker {
     thumb: Option<GpuPhoto>,
     /// The LUT shown in the comparison view.
     selected: Option<(PathBuf, GpuLut)>,
+    /// Composite of the Grade page's look LUTs.
+    look: Option<GpuLut>,
     /// Last grade baked for the Lab, reused until the grade changes.
     grade_lut: std::cell::RefCell<Option<(Grade, Arc<Lut3d>)>>,
 }
@@ -295,9 +324,16 @@ impl Worker {
                 self.photo = Some(gpu.upload(&p));
                 self.source = Some(p);
             }
+            Job::SetLook(layers) => {
+                // ponytail: 33³ preview composite, like the Lab; exports compose exactly.
+                self.look = (!layers.is_empty()).then(|| {
+                    let stack = Stack { input: Profile::Standard, layers, blend: Blend::Chain };
+                    gpu.upload_lut(&lab::compose(&stack, 33, &|g| self.bake_cached(gpu, g)))
+                });
+            }
             Job::Render(grade, split) => {
                 let Some(ph) = &self.photo else { return };
-                let rgba = gpu.render(ph, &grade, split);
+                let rgba = gpu.render(ph, &grade, self.look.as_ref(), split);
                 let scopes = Scopes::compute(&rgba, ph.width, ph.height, split);
                 notify(Done::Graded { width: ph.width, height: ph.height, rgba, scopes });
             }
@@ -333,9 +369,9 @@ impl Worker {
                 let lut = lab::compose(&stack, size, &|g| self.bake_cached(gpu, g));
                 notify(Done::Exported(Lut3d { title, format, ..lut }.save(&path).map(|_| path)));
             }
-            Job::Export { grade, size, format, title, path } => {
+            Job::Export { grade, look, size, format, title, path } => {
                 let size = format.fixed_size().unwrap_or(size);
-                let lut = Lut3d { format, ..gpu.bake(&grade, size, title) };
+                let lut = Lut3d { format, ..gpu.bake_with_look(grade, look, size, title) };
                 notify(Done::Exported(lut.save(&path).map(|_| path)));
             }
         }
@@ -358,7 +394,7 @@ pub fn spawn(notify: impl Fn(Done) + Send + 'static) -> mpsc::Sender<Job> {
             while let Ok(first) = rx.recv() {
                 // Keep only the newest job per slot, preserving order otherwise.
                 let mut batch: Vec<Job> = std::iter::once(first).chain(rx.try_iter()).collect();
-                let mut seen = [false; 4];
+                let mut seen = [false; 5];
                 batch.reverse();
                 batch.retain(|j| j.slot().is_none_or(|s| !std::mem::replace(&mut seen[s as usize], true)));
                 batch.reverse();
@@ -368,7 +404,7 @@ pub fn spawn(notify: impl Fn(Done) + Send + 'static) -> mpsc::Sender<Job> {
                 for job in rest.into_iter().chain(gallery) {
                     // A device loss or validation error panics inside wgpu: report it instead of dying silently.
                     if catch_unwind(AssertUnwindSafe(|| worker.handle(&gpu, job, &notify))).is_err() {
-                        return notify(Done::Failed("errore della GPU, riavvia l'applicazione".into()));
+                        return notify(Done::Failed("GPU error, restart the application".into()));
                     }
                 }
             }
@@ -411,7 +447,7 @@ mod tests {
                 .collect(),
         };
         let gp = gpu.upload(&photo);
-        let direct = gpu.render(&gp, &grade, 0.0);
+        let direct = gpu.render(&gp, &grade, None, 0.0);
         let via_lut = gpu.apply_lut(&gp, &gpu.upload_lut(&gpu.bake(&grade, 65, "t".into())), 0.0);
         let diff: Vec<u8> = direct.iter().zip(&via_lut).map(|(a, b)| a.abs_diff(*b)).collect();
         let worst = *diff.iter().max().unwrap();
@@ -420,13 +456,34 @@ mod tests {
         assert!(worst <= 8 && mean < 0.5, "65³ LUT vs direct grade: worst {worst}/255, mean {mean}");
     }
 
+    /// A look made of an identity LUT leaves the exported grade unchanged;
+    /// a full-strength look LUT replaces the grade's output with lut(grade).
+    #[test]
+    fn look_luts_follow_the_grade() {
+        let Ok(gpu) = Gpu::new() else { return eprintln!("no GPU, skipped") };
+        let mut grade = Grade::default();
+        grade.params.exposure = 0.3;
+        grade.params.saturation = 15.0;
+        let plain = gpu.bake(&grade, 17, "g".into());
+        let layer = |lut: Lut3d| Layer { source: Source::Lut(Arc::new(lut)), intensity: 1.0, input: Profile::Standard };
+        let same = gpu.bake_with_look(grade.clone(), vec![layer(Lut3d::identity(33, Format::Cube))], 17, "g".into());
+        let mut inverted = Lut3d::identity(17, Format::Cube);
+        inverted.data.iter_mut().for_each(|c| *c = c.map(|v| 1.0 - v));
+        let looked = gpu.bake_with_look(grade, vec![layer(inverted)], 17, "g".into());
+        for ((a, b), c) in plain.data.iter().zip(&same.data).zip(&looked.data) {
+            for k in 0..3 {
+                assert!((a[k] - b[k]).abs() < 1e-4, "identity look changed {a:?} → {b:?}");
+                assert!((1.0 - a[k].clamp(0.0, 1.0) - c[k]).abs() < 1e-3, "look not applied: {a:?} → {c:?}");
+            }
+        }
+    }
+
     /// Every log profile: CPU encode (gamut + OETF) followed by the GPU
     /// decode + view transform must reproduce the CPU view transform, so all
     /// profiles start from the same look and the decoders match the encoders.
     #[test]
     fn log_inputs_match_cpu_view_transform() {
         use crate::photo::{multiply_row1, view_transform};
-        use crate::profiles::Profile;
         let Ok(gpu) = Gpu::new() else { return eprintln!("no GPU, skipped") };
         let scene: Vec<[f32; 3]> = [0.0f32, 0.02, 0.09, 0.18, 0.36, 0.9, 2.0]
             .iter()
@@ -444,7 +501,7 @@ mod tests {
             let photo = Photo { width: scene.len() as u32, height: 1, pixels };
             let mut grade = Grade::default();
             grade.params.set_input(profile);
-            let out = gpu.render(&gpu.upload(&photo), &grade, 0.0);
+            let out = gpu.render(&gpu.upload(&photo), &grade, None, 0.0);
             for (i, c) in scene.iter().enumerate() {
                 let want = view_transform(*c).map(|v| (v * 255.0).round() as i32);
                 let got = [0, 1, 2].map(|k| out[i * 4 + k] as i32);

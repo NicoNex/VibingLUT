@@ -3,6 +3,7 @@
 #   make release / run-release  optimised build
 #   make install PREFIX=~/.local
 #   make arch                   build an Arch Linux package with makepkg
+#   make pot                    refresh po/vibinglut.pot and merge it into po/*.po
 
 PREFIX  ?= /usr/local
 DESTDIR ?=
@@ -13,21 +14,23 @@ APP_ID  := io.github.vibinglut.VibingLUT
 BIN     := vibinglut
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 ARCHDIR := packaging/arch
+LINGUAS := $(basename $(notdir $(wildcard po/*.po)))
+MOS     := $(foreach l,$(LINGUAS),target/locale/$(l)/LC_MESSAGES/$(BIN).mo)
 
-.PHONY: all build run release run-release test check fmt clean install uninstall arch
+.PHONY: all build run release run-release test check fmt clean install uninstall arch pot locale
 
 all: release
 
-build:
+build: locale
 	$(CARGO) build
 
-run:
+run: locale
 	$(CARGO) run -p $(BIN) -- $(FILE)
 
-release:
+release: locale
 	$(CARGO) build --release
 
-run-release:
+run-release: locale
 	$(CARGO) run --release -p $(BIN) -- $(FILE)
 
 test:
@@ -41,11 +44,24 @@ check:
 fmt:
 	$(CARGO) fmt --all
 
+locale: $(MOS)
+
+target/locale/%/LC_MESSAGES/$(BIN).mo: po/%.po
+	@mkdir -p $(dir $@)
+	msgfmt --check -o $@ $<
+
+pot:
+	xgettext -L Rust --from-code=UTF-8 -k --keyword=gettext --keyword='gettext!' \
+	  --package-name=VibingLUT -o po/$(BIN).pot gtk/src/*.rs
+	for l in $(LINGUAS); do msgmerge -U --backup=none po/$$l.po po/$(BIN).pot; done
+
 target/release/$(BIN):
 	$(CARGO) build --release
 
-install: target/release/$(BIN)
+install: target/release/$(BIN) locale
 	install -Dm755 target/release/$(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
+	for l in $(LINGUAS); do install -Dm644 target/locale/$$l/LC_MESSAGES/$(BIN).mo \
+	  $(DESTDIR)$(PREFIX)/share/locale/$$l/LC_MESSAGES/$(BIN).mo; done
 	install -Dm644 data/$(APP_ID).desktop $(DESTDIR)$(PREFIX)/share/applications/$(APP_ID).desktop
 	install -Dm644 data/$(APP_ID).svg $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/$(APP_ID).svg
 	install -Dm644 LICENSE $(DESTDIR)$(PREFIX)/share/licenses/$(BIN)/LICENSE
@@ -53,7 +69,8 @@ install: target/release/$(BIN)
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN) \
 	      $(DESTDIR)$(PREFIX)/share/applications/$(APP_ID).desktop \
-	      $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/$(APP_ID).svg
+	      $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/$(APP_ID).svg \
+	      $(foreach l,$(LINGUAS),$(DESTDIR)$(PREFIX)/share/locale/$(l)/LC_MESSAGES/$(BIN).mo)
 	rm -rf $(DESTDIR)$(PREFIX)/share/licenses/$(BIN)
 
 # Packages the committed HEAD (commit first!).

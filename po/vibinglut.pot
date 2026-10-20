@@ -1,0 +1,621 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the VibingLUT package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: VibingLUT\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-10-21 17:32+0200\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: gtk/src/lab_page.rs:54
+msgid "current grade"
+msgstr ""
+
+#: gtk/src/lab_page.rs:55
+#, rust-format
+msgid "conversion to {}"
+msgstr ""
+
+#: gtk/src/lab_page.rs:57 gtk/src/lab_page.rs:366
+#, rust-format
+msgid "Input: {}"
+msgstr ""
+
+#: gtk/src/lab_page.rs:65
+#, rust-format
+msgid "converted to {}"
+msgstr ""
+
+#: gtk/src/lab_page.rs:77
+#, rust-format
+msgid "mix of {}"
+msgstr ""
+
+#: gtk/src/lab_page.rs:88
+#, rust-format
+msgid "Output: {}"
+msgstr ""
+
+#: gtk/src/lab_page.rs:93
+msgid "Chain: layers apply one after another; intensity fades each step."
+msgstr ""
+
+#: gtk/src/lab_page.rs:98
+msgid ""
+"Mix: every LUT gets the same input; outputs are averaged in OKLab weighted "
+"by intensity (below 100% the rest is the neutral image). Conversions apply "
+"to the result."
+msgstr ""
+
+#: gtk/src/lab_page.rs:136
+msgid ""
+"To convert a LUT from one profile to another: 1) add the LUT, 2) check which "
+"profile it was made for, 3) choose the signal you will use the result on, 4) "
+"export."
+msgstr ""
+
+#: gtk/src/lab_page.rs:143 gtk/src/main.rs:703
+msgid "LUT from file…"
+msgstr ""
+
+#: gtk/src/lab_page.rs:144 gtk/src/main.rs:704
+msgid "LUT selected in Compare"
+msgstr ""
+
+#: gtk/src/lab_page.rs:145 gtk/src/lab_page.rs:315
+msgid "Current grade"
+msgstr ""
+
+#: gtk/src/lab_page.rs:146
+msgid "Profile conversion"
+msgstr ""
+
+#: gtk/src/lab_page.rs:150
+msgid "Add layer"
+msgstr ""
+
+#: gtk/src/lab_page.rs:154
+msgid "1 · Layers"
+msgstr ""
+
+#: gtk/src/lab_page.rs:161
+msgid "No layers."
+msgstr ""
+
+#: gtk/src/lab_page.rs:163
+msgid "Add a LUT…"
+msgstr ""
+
+#: gtk/src/lab_page.rs:175
+msgid "Signal the final LUT will be used on"
+msgstr ""
+
+#: gtk/src/lab_page.rs:181
+msgid "2 · I will use the final LUT on"
+msgstr ""
+
+#: gtk/src/lab_page.rs:195
+msgid "Layer blending"
+msgstr ""
+
+#: gtk/src/lab_page.rs:198
+msgid "Chain"
+msgstr ""
+
+#: gtk/src/lab_page.rs:198
+msgid "Mix"
+msgstr ""
+
+#: gtk/src/lab_page.rs:216
+msgid "3 · Export"
+msgstr ""
+
+#: gtk/src/lab_page.rs:225
+msgid "More formats (VLT, HALD, 129³)…"
+msgstr ""
+
+#: gtk/src/lab_page.rs:248
+msgid "Combined LUT preview"
+msgstr ""
+
+#: gtk/src/lab_page.rs:257
+msgid ""
+"Combine LUTs, grades and profile conversions: chained or mixed, each with "
+"its own intensity.\n"
+"E.g. a Fujifilm LUT for F-Log becomes a LUT for V-Log or for the Standard "
+"profile."
+msgstr ""
+
+#: gtk/src/lab_page.rs:316
+msgid "Conversion"
+msgstr ""
+
+#: gtk/src/lab_page.rs:331
+msgid "Move up"
+msgstr ""
+
+#: gtk/src/lab_page.rs:332
+msgid "Move down"
+msgstr ""
+
+#: gtk/src/lab_page.rs:333
+msgid "Remove"
+msgstr ""
+
+#: gtk/src/lab_page.rs:352
+msgid "This LUT was made for:"
+msgstr ""
+
+#: gtk/src/lab_page.rs:353
+msgid "Convert the signal to"
+msgstr ""
+
+#: gtk/src/lab_page.rs:369
+msgid "Intensity"
+msgstr ""
+
+#: gtk/src/main.rs:161
+msgid "GPU unavailable"
+msgstr ""
+
+#: gtk/src/main.rs:191 gtk/src/main.rs:1711
+msgid "Test chart"
+msgstr ""
+
+#: gtk/src/main.rs:461
+msgid "Reds"
+msgstr ""
+
+#: gtk/src/main.rs:462
+msgid "Oranges"
+msgstr ""
+
+#: gtk/src/main.rs:463
+msgid "Yellows"
+msgstr ""
+
+#: gtk/src/main.rs:464
+msgid "Greens"
+msgstr ""
+
+#: gtk/src/main.rs:465
+msgid "Teals"
+msgstr ""
+
+#: gtk/src/main.rs:466
+msgid "Blues"
+msgstr ""
+
+#: gtk/src/main.rs:467
+msgid "Purples"
+msgstr ""
+
+#: gtk/src/main.rs:468
+msgid "Magentas"
+msgstr ""
+
+#: gtk/src/main.rs:529
+msgid "Histogram"
+msgstr ""
+
+#: gtk/src/main.rs:530
+msgid "Waveform"
+msgstr ""
+
+#: gtk/src/main.rs:531
+msgid "Vectorscope"
+msgstr ""
+
+#: gtk/src/main.rs:542
+msgid "Scopes"
+msgstr ""
+
+#: gtk/src/main.rs:547 gtk/src/main.rs:562
+msgid "Input profile"
+msgstr ""
+
+#: gtk/src/main.rs:574
+msgid "Temperature"
+msgstr ""
+
+#: gtk/src/main.rs:575
+msgid "Tint"
+msgstr ""
+
+#: gtk/src/main.rs:576
+msgid "White balance"
+msgstr ""
+
+#: gtk/src/main.rs:579
+msgid "Exposure"
+msgstr ""
+
+#: gtk/src/main.rs:580
+msgid "Contrast"
+msgstr ""
+
+#: gtk/src/main.rs:581
+msgid "Highlights"
+msgstr ""
+
+#: gtk/src/main.rs:582
+msgid "Shadows"
+msgstr ""
+
+#: gtk/src/main.rs:583
+msgid "Whites"
+msgstr ""
+
+#: gtk/src/main.rs:584
+msgid "Blacks"
+msgstr ""
+
+#: gtk/src/main.rs:585
+msgid "Tone"
+msgstr ""
+
+#: gtk/src/main.rs:588 gtk/src/main.rs:643
+msgid "Saturation"
+msgstr ""
+
+#: gtk/src/main.rs:589
+msgid "Vibrance"
+msgstr ""
+
+#: gtk/src/main.rs:590
+msgid "Shadow saturation"
+msgstr ""
+
+#: gtk/src/main.rs:591
+msgid "Highlight saturation"
+msgstr ""
+
+#: gtk/src/main.rs:592
+msgid "Color"
+msgstr ""
+
+#: gtk/src/main.rs:610
+msgid "Primary color wheels"
+msgstr ""
+
+#: gtk/src/main.rs:643
+msgid "Hue"
+msgstr ""
+
+#: gtk/src/main.rs:643
+msgid "Luminance"
+msgstr ""
+
+#: gtk/src/main.rs:650
+msgid "Selective color"
+msgstr ""
+
+#: gtk/src/main.rs:657
+msgid "Red"
+msgstr ""
+
+#: gtk/src/main.rs:658
+msgid "Green"
+msgstr ""
+
+#: gtk/src/main.rs:659
+msgid "Blue"
+msgstr ""
+
+#: gtk/src/main.rs:668
+msgid "Reset curve"
+msgstr ""
+
+#: gtk/src/main.rs:679
+msgid "Click to add a point, double-click or right-click to remove it"
+msgstr ""
+
+#: gtk/src/main.rs:685
+msgid "Curves"
+msgstr ""
+
+#: gtk/src/main.rs:692
+msgid "No LUTs: the grade is exported as is."
+msgstr ""
+
+#: gtk/src/main.rs:707 gtk/src/main.rs:1560
+msgid "Add LUT"
+msgstr ""
+
+#: gtk/src/main.rs:715
+msgid ""
+"Applied after the grade, top to bottom, and included in the exported LUT."
+msgstr ""
+
+#: gtk/src/main.rs:721
+msgid "LUTs"
+msgstr ""
+
+#: gtk/src/main.rs:724
+msgid "Reset all"
+msgstr ""
+
+#: gtk/src/main.rs:791
+msgid "Grade preview"
+msgstr ""
+
+#: gtk/src/main.rs:813
+msgid "Open a photo"
+msgstr ""
+
+#: gtk/src/main.rs:814
+msgid ""
+"Drop a JPEG or camera RAW here, or choose a file.\n"
+"The grade becomes a .cube LUT for the Standard profile."
+msgstr ""
+
+#: gtk/src/main.rs:815
+msgid "Open Photo…"
+msgstr ""
+
+#: gtk/src/main.rs:855 gtk/src/main.rs:1128
+msgid "No folder"
+msgstr ""
+
+#: gtk/src/main.rs:863
+msgid "Choose LUT folder"
+msgstr ""
+
+#: gtk/src/main.rs:872
+msgid "Open the selected LUT in LUT Lab (to convert or combine it)"
+msgstr ""
+
+#: gtk/src/main.rs:881
+msgid "Subfolder"
+msgstr ""
+
+#: gtk/src/main.rs:885 gtk/src/main.rs:1714
+msgid "Search LUTs"
+msgstr ""
+
+#: gtk/src/main.rs:896
+msgid "No LUTs"
+msgstr ""
+
+#: gtk/src/main.rs:897
+msgid "Choose a folder with .cube files"
+msgstr ""
+
+#: gtk/src/main.rs:923
+msgid "Selected LUT preview"
+msgstr ""
+
+#: gtk/src/main.rs:931 gtk/src/main.rs:950
+msgid "Compare LUTs"
+msgstr ""
+
+#: gtk/src/main.rs:932
+msgid ""
+"Choose a folder of .cube LUTs: each one is applied to the current photo with "
+"tetrahedral interpolation on the GPU."
+msgstr ""
+
+#: gtk/src/main.rs:933
+msgid "Choose Folder…"
+msgstr ""
+
+#: gtk/src/main.rs:969
+msgid "Open Photo (Ctrl+O)"
+msgstr ""
+
+#: gtk/src/main.rs:976
+msgid "Test chart: shows what the LUT does to neutrals, hues and skin (T)"
+msgstr ""
+
+#: gtk/src/main.rs:984
+msgid "Default"
+msgstr ""
+
+#: gtk/src/main.rs:985
+msgid "Black"
+msgstr ""
+
+#: gtk/src/main.rs:986
+msgid "White"
+msgstr ""
+
+#: gtk/src/main.rs:987
+msgid "Preview background"
+msgstr ""
+
+#: gtk/src/main.rs:989 gtk/src/main.rs:1715
+msgid "Preferences"
+msgstr ""
+
+#: gtk/src/main.rs:990 gtk/src/main.rs:1716
+msgid "Keyboard Shortcuts"
+msgstr ""
+
+#: gtk/src/main.rs:991
+msgid "About VibingLUT"
+msgstr ""
+
+#: gtk/src/main.rs:998
+msgid "Main Menu"
+msgstr ""
+
+#: gtk/src/main.rs:1004 gtk/src/main.rs:1709
+msgid "Export LUT"
+msgstr ""
+
+#: gtk/src/main.rs:1007
+msgid "Export 33³ .cube for Lumix (Ctrl+E)"
+msgstr ""
+
+#: gtk/src/main.rs:1016
+msgid "Before / after (\\)"
+msgstr ""
+
+#: gtk/src/main.rs:1024
+msgid "Show panel"
+msgstr ""
+
+#: gtk/src/main.rs:1106
+msgid ""
+"Color grading from photos and 3D .cube LUT creation, GPU accelerated (Vulkan/"
+"Metal)."
+msgstr ""
+
+#: gtk/src/main.rs:1120
+msgid "Choose folder"
+msgstr ""
+
+#: gtk/src/main.rs:1127 gtk/src/main.rs:1422
+msgid "LUT folder"
+msgstr ""
+
+#: gtk/src/main.rs:1133
+msgid "LUT library"
+msgstr ""
+
+#: gtk/src/main.rs:1134
+msgid "LUT files in this folder and its subfolders appear in Compare LUTs."
+msgstr ""
+
+#: gtk/src/main.rs:1138
+msgid "General"
+msgstr ""
+
+#: gtk/src/main.rs:1260 gtk/src/main.rs:1708
+msgid "Open Photo"
+msgstr ""
+
+#: gtk/src/main.rs:1261
+msgid "Photos and RAWs"
+msgstr ""
+
+#: gtk/src/main.rs:1299
+#, rust-format
+msgid "Cannot open {}: {}"
+msgstr ""
+
+#: gtk/src/main.rs:1385
+#, rust-format
+msgid "Export {}"
+msgstr ""
+
+#: gtk/src/main.rs:1432
+#, rust-format
+msgid "Cannot save the LUT folder: {}"
+msgstr ""
+
+#: gtk/src/main.rs:1446
+#, rust-format
+msgid "{} files skipped: {}"
+msgstr ""
+
+#: gtk/src/main.rs:1451
+#, rust-format
+msgid "Very large library: showing the first {} LUTs"
+msgstr ""
+
+#: gtk/src/main.rs:1487
+msgid "All folders"
+msgstr ""
+
+#: gtk/src/main.rs:1489
+msgid "Main folder"
+msgstr ""
+
+#: gtk/src/main.rs:1555
+msgid "Select a LUT in Compare LUTs first"
+msgstr ""
+
+#: gtk/src/main.rs:1561
+msgid "LUTs (.cube, .vlt, HALD .png)"
+msgstr ""
+
+#: gtk/src/main.rs:1586
+#, rust-format
+msgid "Cannot read {}: {}"
+msgstr ""
+
+#: gtk/src/main.rs:1636
+#, rust-format
+msgid "GPU unavailable: {}"
+msgstr ""
+
+#: gtk/src/main.rs:1658
+#, rust-format
+msgid "LUT saved: {}"
+msgstr ""
+
+#: gtk/src/main.rs:1660
+#, rust-format
+msgid "Export failed: {}"
+msgstr ""
+
+#: gtk/src/main.rs:1667
+#, rust-format
+msgid ""
+"{} LUT → Rec.709. RAWs are encoded into this log; a JPEG/TIFF must already "
+"be in log."
+msgstr ""
+
+#: gtk/src/main.rs:1669
+msgid "Signal the LUT will be applied to (Photo Style Standard, Vivid…)."
+msgstr ""
+
+#: gtk/src/main.rs:1681
+msgid "Camera"
+msgstr ""
+
+#: gtk/src/main.rs:1683
+msgid "Post-production · 65³ .cube"
+msgstr ""
+
+#: gtk/src/main.rs:1684
+msgid "High precision · 129³ .cube"
+msgstr ""
+
+#: gtk/src/main.rs:1686
+msgid "Post-production"
+msgstr ""
+
+#: gtk/src/main.rs:1689
+msgid "HALD identity · .png"
+msgstr ""
+
+#: gtk/src/main.rs:1690
+msgid "Tools"
+msgstr ""
+
+#: gtk/src/main.rs:1710
+msgid "Before / after"
+msgstr ""
+
+#: gtk/src/main.rs:1712
+msgid "Grade view"
+msgstr ""
+
+#: gtk/src/main.rs:1713
+msgid "Compare LUTs view"
+msgstr ""
+
+#: gtk/src/widgets.rs:36
+msgid "Reset"
+msgstr ""
+
+#: gtk/src/widgets.rs:39
+#, rust-format
+msgid "Reset {}"
+msgstr ""
+
+#: gtk/src/widgets.rs:151
+msgid "Curve editor"
+msgstr ""

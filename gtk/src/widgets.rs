@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::f64::consts::TAU;
 use std::rc::Rc;
 
+use gettextrs::gettext;
 use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::gtk::{cairo, gdk};
@@ -32,10 +33,10 @@ impl Slider {
         let reset = gtk::Button::builder()
             .icon_name("edit-undo-symbolic")
             .css_classes(["flat", "circular", "slider-reset"])
-            .tooltip_text("Ripristina")
+            .tooltip_text(gettext("Reset"))
             .valign(gtk::Align::Center)
             .build();
-        reset.update_property(&[gtk::accessible::Property::Label(&format!("Ripristina {label}"))]);
+        reset.update_property(&[gtk::accessible::Property::Label(&gettext!("Reset {}", label))]);
         head.append(&name);
         head.append(&reset);
         head.append(&value);
@@ -147,7 +148,7 @@ impl CurveEditor {
             drag: None,
         }));
         let area = gtk::DrawingArea::builder().content_height(260).hexpand(true).css_classes(["curve-area"]).build();
-        area.update_property(&[gtk::accessible::Property::Label("Editor curve")]);
+        area.update_property(&[gtk::accessible::Property::Label(&gettext("Curve editor"))]);
 
         let s = state.clone();
         area.set_draw_func(move |area, cr, w, h| draw_curves(area, cr, w as f64, h as f64, &s.borrow()));
