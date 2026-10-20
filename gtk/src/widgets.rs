@@ -15,6 +15,7 @@ use vibinglut_core::grade::{Curve, identity_curve, sample_curve};
 #[derive(Clone)]
 pub struct Slider {
     pub root: gtk::Box,
+    pub scale: gtk::Scale,
     pub adj: gtk::Adjustment,
     pub default: f64,
 }
@@ -71,7 +72,23 @@ impl Slider {
         });
         scale.add_controller(dbl);
 
-        Self { root, adj, default }
+        // The mouse wheel scrolls the panel, never the value: a slider under
+        // the pointer must not change while scrolling past it.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let sc = scale.clone();
+        scroll.connect_scroll(move |c, _, dy| {
+            if let Some(sw) = sc.ancestor(gtk::ScrolledWindow::static_type()).and_downcast::<gtk::ScrolledWindow>() {
+                let a = sw.vadjustment();
+                // Wheel clicks scroll like GTK does natively; touchpads report pixels.
+                let step = if c.unit() == gdk::ScrollUnit::Wheel { a.page_size().powf(2.0 / 3.0) } else { 1.0 };
+                a.set_value(a.value() + dy * step);
+            }
+            gtk::glib::Propagation::Stop
+        });
+        scale.add_controller(scroll);
+
+        Self { root, scale, adj, default }
     }
 
     pub fn connect(&self, f: impl Fn(f64) + 'static) {
@@ -304,8 +321,8 @@ pub struct ColorWheel {
 impl ColorWheel {
     pub fn new(name: &str, on_change: impl Fn(f32, f32) + 'static) -> Self {
         let area = gtk::DrawingArea::builder()
-            .content_width(96)
-            .content_height(96)
+            .content_width(150)
+            .content_height(150)
             .halign(gtk::Align::Center)
             .css_classes(["color-wheel"])
             .build();
@@ -315,20 +332,30 @@ impl ColorWheel {
         area.set_draw_func(move |_, cr, w, h| draw_wheel(cr, w as f64, h as f64, *p.borrow()));
         let this = Self { area: area.clone(), pos, on_change: Rc::new(on_change) };
 
+        // Double-click resets. The drag gesture also sees that press, so it is
+        // muted until release (whichever controller runs first).
+        let resetting = Rc::new(std::cell::Cell::new(false));
         let drag = gtk::GestureDrag::new();
-        let t = this.clone();
-        drag.connect_drag_begin(move |_, x, y| t.set_from_widget(x, y));
-        let t = this.clone();
+        let (t, r) = (this.clone(), resetting.clone());
+        drag.connect_drag_begin(move |_, x, y| {
+            if !r.get() {
+                t.set_from_widget(x, y);
+            }
+        });
+        let (t, r) = (this.clone(), resetting.clone());
         drag.connect_drag_update(move |g, dx, dy| {
-            if let Some((x, y)) = g.start_point() {
+            if let (false, Some((x, y))) = (r.get(), g.start_point()) {
                 t.set_from_widget(x + dx, y + dy);
             }
         });
+        let r = resetting.clone();
+        drag.connect_drag_end(move |_, _, _| r.set(false));
         area.add_controller(drag);
         let dbl = gtk::GestureClick::new();
-        let t = this.clone();
+        let (t, r) = (this.clone(), resetting);
         dbl.connect_pressed(move |_, n, _, _| {
             if n == 2 {
+                r.set(true);
                 t.set(0.0, 0.0);
             }
         });

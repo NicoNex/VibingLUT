@@ -163,6 +163,12 @@ pub fn compose(stack: &Stack, size: usize, bake: &dyn Fn(&Grade) -> Arc<Lut3d>) 
     out
 }
 
+/// OKLCh (lightness, chroma, hue in radians) → display-encoded sRGB,
+/// clipped to the gamut. Used to draw swatches that match the shader.
+pub fn oklch_to_srgb(l: f32, c: f32, h: f32) -> [f32; 3] {
+    from_oklab([l, c * h.cos(), c * h.sin()])
+}
+
 fn mix_oklab(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     if t >= 1.0 {
         return b;

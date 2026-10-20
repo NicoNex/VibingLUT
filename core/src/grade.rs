@@ -7,6 +7,13 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::profiles::Profile;
 
+/// OKLCh hue centres (radians) of the 8 selective-colour bands — red,
+/// orange, yellow, green, teal, blue, purple, magenta. Mirrors `HUES` in
+/// `grade.wgsl`.
+pub const BAND_HUES: [f32; 8] = [0.506, 0.960, 1.920, 2.478, 3.403, 4.608, 5.236, 5.725];
+/// Hue shift at ±100 on a band, in radians (`band(p.hue_shift) * 0.005`).
+pub const BAND_HUE_RANGE: f32 = 0.5;
+
 /// Resolution of each baked tone curve sent to the GPU.
 pub const CURVE_RES: usize = 1024;
 

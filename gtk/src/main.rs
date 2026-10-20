@@ -13,8 +13,8 @@ use relm4::gtk::{gdk, gio, glib};
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk};
 use vibinglut_core::chart::test_chart;
 use vibinglut_core::gpu::{self, Done, Job};
-use vibinglut_core::grade::{Curve, Grade, Params};
-use vibinglut_core::lab::{Blend, Layer, Source, Stack};
+use vibinglut_core::grade::{BAND_HUE_RANGE, BAND_HUES, Curve, Grade, Params};
+use vibinglut_core::lab::{Blend, Layer, Source, Stack, oklch_to_srgb};
 use vibinglut_core::lut::{Format, Lut3d, LutEntry, MAX_LIBRARY};
 use vibinglut_core::photo::{Decoded, Photo, RASTER_EXTS, RAW_EXTS};
 use vibinglut_core::profiles::Profile;
@@ -271,7 +271,7 @@ impl App {
 
     fn lab_changed(&mut self, structure: bool, sender: &ComponentSender<Self>) {
         if structure {
-            self.ui.lab.rebuild(&self.lab_layers, self.source_profile(), sender);
+            self.ui.lab.rebuild(&self.lab_layers, self.lab_blend, self.lab_input, self.source_profile(), sender);
         }
         self.render_lab();
     }
@@ -371,29 +371,53 @@ const CSS: &str = r#"
 .slider-reset { min-width: 24px; min-height: 24px; padding: 0; }
 scale.track-temp trough { background-image: linear-gradient(to right, #4f86e8, #e8e8e8, #f2b84b); }
 scale.track-tint trough { background-image: linear-gradient(to right, #4cbf5a, #e8e8e8, #d85bd0); }
-scale.track-hue trough { background-image: linear-gradient(to right, #e44, #ea4, #ee4, #4e4, #4ee, #44e, #e4e, #e44); }
-scale.track-temp trough highlight, scale.track-tint trough highlight, scale.track-hue trough highlight { background: none; }
+scale.track-temp trough highlight, scale.track-tint trough highlight { background: none; }
 .scope { background-color: rgba(0,0,0,0.55); border-radius: 8px; }
 .band { min-width: 22px; min-height: 22px; padding: 0; border-radius: 99px; }
 .band:checked { box-shadow: 0 0 0 2px var(--accent-color); }
+flowboxchild { padding: 0; border-radius: 12px; }
+flowboxchild:selected { background: none; }
 .thumb-card { padding: 6px; border-radius: 12px; }
 .thumb-card picture { border-radius: 8px; }
-flowboxchild:selected .thumb-card { background-color: color-mix(in srgb, var(--accent-bg-color) 30%, transparent); }
+flowboxchild:selected .thumb-card { background-color: color-mix(in srgb, var(--accent-bg-color) 35%, transparent); }
 .lut-badge { margin: 5px; padding: 1px 6px; border-radius: 6px; font-size: 0.68em; font-weight: 800;
   letter-spacing: 0.04em; color: rgba(255,255,255,0.92); background-color: rgba(0,0,0,0.45); }
+.lab-summary { padding: 8px 10px; border-radius: 8px; background-color: color-mix(in srgb, var(--accent-bg-color) 14%, transparent); }
 .osd-info { padding: 4px 10px; border-radius: 99px; font-size: 0.9em; }
 "#;
 
-const BANDS: [(&str, &str); 8] = [
-    ("Rossi", "#e5484d"),
-    ("Arancioni", "#f08c3a"),
-    ("Gialli", "#e8c93a"),
-    ("Verdi", "#46b35a"),
-    ("Teal", "#2fb5b0"),
-    ("Blu", "#3f7ae0"),
-    ("Viola", "#8a5ad8"),
-    ("Magenta", "#d655b4"),
-];
+/// Selective-colour band names; their hues are `grade::BAND_HUES`.
+const BANDS: [&str; 8] = ["Rossi", "Arancioni", "Gialli", "Verdi", "Teal", "Blu", "Viola", "Magenta"];
+/// CSS class prefixes of the band's hue / saturation / luminance tracks.
+const BAND_TRACKS: [&str; 3] = ["hue", "sat", "lum"];
+
+/// Swatches and slider tracks computed in OKLCh from the shader's own band
+/// hues, so each track shows exactly what moving it does to that band.
+fn band_css() -> String {
+    let hex = |l: f32, c: f32, h: f32| {
+        let [r, g, b] = oklch_to_srgb(l, c, h).map(|v| (v * 255.0).round() as u8);
+        format!("#{r:02x}{g:02x}{b:02x}")
+    };
+    let mut css = String::new();
+    for (i, &h) in BAND_HUES.iter().enumerate() {
+        let hue: Vec<String> =
+            [-1.0, -0.5, 0.0, 0.5, 1.0].iter().map(|t| hex(0.72, 0.13, h + t * BAND_HUE_RANGE)).collect();
+        css += &format!(".band-{i} {{ background: {}; }}\n", hex(0.68, 0.15, h));
+        css +=
+            &format!("scale.hue-{i} trough {{ background-image: linear-gradient(to right, {}); }}\n", hue.join(", "));
+        css += &format!(
+            "scale.sat-{i} trough {{ background-image: linear-gradient(to right, {}, {}); }}\n",
+            hex(0.72, 0.0, h),
+            hex(0.72, 0.2, h)
+        );
+        css += &format!(
+            "scale.lum-{i} trough {{ background-image: linear-gradient(to right, {}, {}); }}\n",
+            hex(0.38, 0.1, h),
+            hex(0.92, 0.1, h)
+        );
+    }
+    css
+}
 
 struct Sidebar {
     scroll: gtk::ScrolledWindow,
@@ -502,10 +526,10 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
 
     // HSL mixer (OKLCh bands)
     let hsl = vbox(6);
-    let band_name = gtk::Label::builder().label(BANDS[0].0).css_classes(["caption-heading"]).build();
+    let band_name = gtk::Label::builder().label(BANDS[0]).css_classes(["caption-heading"]).build();
     let dots = gtk::Box::builder().spacing(6).halign(gtk::Align::Center).build();
     let mut first: Option<gtk::ToggleButton> = None;
-    for (i, (name, _)) in BANDS.iter().enumerate() {
+    for (i, name) in BANDS.iter().enumerate() {
         let b = gtk::ToggleButton::builder().tooltip_text(*name).css_classes(["band", &format!("band-{i}")]).build();
         b.update_property(&[gtk::accessible::Property::Label(name)]);
         match &first {
@@ -518,7 +542,7 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
         let (snd, bn) = (sender.clone(), band_name.clone());
         b.connect_toggled(move |b| {
             if b.is_active() {
-                bn.set_label(BANDS[i].0);
+                bn.set_label(BANDS[i]);
                 snd.input(Msg::Band(i));
             }
         });
@@ -527,8 +551,8 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     hsl.append(&dots);
     hsl.append(&band_name);
     let hue: [Slider; 3] = std::array::from_fn(|k| {
-        let (label, track) = [("Tinta", Some("track-hue")), ("Saturazione", None), ("Luminanza", None)][k];
-        let s = Slider::new(label, -100.0, 100.0, 0.0, 0, track);
+        let label = ["Tinta", "Saturazione", "Luminanza"][k];
+        let s = Slider::new(label, -100.0, 100.0, 0.0, 0, Some(&format!("{}-0", BAND_TRACKS[k])));
         let snd = sender.clone();
         s.connect(move |v| snd.input(Msg::Hue(k, v)));
         hsl.append(&s.root);
@@ -1126,7 +1150,13 @@ impl SimpleComponent for App {
                 self.band = b;
                 // The resulting Hue echoes carry unchanged values, so render() skips them.
                 let p = self.grade.params;
-                for (s, v) in self.ui.sidebar.hue.iter().zip([p.hue_shift[b], p.hue_sat[b], p.hue_lum[b]]) {
+                for (k, (s, v)) in
+                    self.ui.sidebar.hue.iter().zip([p.hue_shift[b], p.hue_sat[b], p.hue_lum[b]]).enumerate()
+                {
+                    for i in 0..BANDS.len() {
+                        s.scale.remove_css_class(&format!("{}-{i}", BAND_TRACKS[k]));
+                    }
+                    s.scale.add_css_class(&format!("{}-{b}", BAND_TRACKS[k]));
                     s.adj.set_value(v as f64);
                 }
             }
@@ -1391,6 +1421,7 @@ impl SimpleComponent for App {
             Msg::LabIntensity(i, v) => {
                 if let Some(l) = self.lab_layers.get_mut(i) {
                     l.intensity = (v / 100.0) as f32;
+                    self.ui.lab.refresh_summary(&self.lab_layers, self.lab_blend, self.lab_input);
                     self.lab_changed(false, &sender);
                 }
             }
@@ -1400,13 +1431,17 @@ impl SimpleComponent for App {
                         LabKind::Convert(to) => *to = p,
                         _ => l.input = p,
                     }
+                    self.ui.lab.refresh_summary(&self.lab_layers, self.lab_blend, self.lab_input);
                     self.lab_changed(false, &sender);
                 }
             }
-            Msg::LabInput(p) => self.lab_input = p,
+            Msg::LabInput(p) => {
+                self.lab_input = p;
+                self.lab_changed(true, &sender);
+            }
             Msg::LabBlend(b) => {
                 self.lab_blend = b;
-                self.lab_changed(false, &sender);
+                self.lab_changed(true, &sender);
             }
             Msg::Page(page) => {
                 self.page = page;
@@ -1514,8 +1549,6 @@ fn shortcuts_dialog() -> adw::ShortcutsDialog {
 fn main() {
     let file = std::env::args().nth(1).map(PathBuf::from);
     let app = RelmApp::new(APP_ID).with_args(Vec::new());
-    let bands: String =
-        BANDS.iter().enumerate().map(|(i, (_, hex))| format!(".band-{i} {{ background: {hex}; }}\n")).collect();
-    relm4::set_global_css(&format!("{CSS}{bands}"));
+    relm4::set_global_css(&format!("{CSS}{}", band_css()));
     app.run::<App>(file);
 }
