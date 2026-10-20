@@ -2,11 +2,11 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 
 use wgpu::util::DeviceExt;
 
-use crate::grade::{Grade, Params};
+use crate::grade::{CURVE_RES, Grade, Params};
 use crate::lut::Lut3d;
 use crate::photo::{Photo, THUMB_MAX};
 use crate::scopes::Scopes;
@@ -17,11 +17,19 @@ pub struct Gpu {
     preview: wgpu::ComputePipeline,
     apply: wgpu::ComputePipeline,
     bake: wgpu::ComputePipeline,
+    /// Persistent uniforms, rewritten per frame with `queue.write_buffer`.
+    params: wgpu::Buffer,
+    curves: wgpu::Buffer,
     pub name: String,
 }
 
+/// A photo resident on the GPU together with its output/readback buffers,
+/// so interactive frames allocate nothing.
 pub struct GpuPhoto {
-    buf: wgpu::Buffer,
+    src: wgpu::Buffer,
+    out: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    preview_bind: wgpu::BindGroup,
     width: u32,
     height: u32,
 }
@@ -64,10 +72,20 @@ impl Gpu {
                 cache: None,
             })
         };
+        let uniform = |size: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: size as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
         Ok(Self {
             preview: pipeline("preview"),
             apply: pipeline("apply_lut"),
             bake: pipeline("bake"),
+            params: uniform(std::mem::size_of::<Params>()),
+            curves: uniform(4 * CURVE_RES * 4),
             name: format!("{} ({:?})", info.name, info.backend),
             device,
             queue,
@@ -82,50 +100,67 @@ impl Gpu {
         })
     }
 
-    pub fn upload(&self, photo: &Photo) -> GpuPhoto {
-        GpuPhoto { buf: self.storage(bytemuck::cast_slice(&photo.pixels)), width: photo.width, height: photo.height }
+    fn output(&self, bytes: u64) -> (wgpu::Buffer, wgpu::Buffer) {
+        let buffer = |usage| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: bytes,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        (
+            buffer(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+        )
     }
 
-    /// Dispatches `pipeline` over `count` items and reads back `out_bytes` from
-    /// a fresh output buffer bound at `out_binding`.
-    fn run(
-        &self,
-        pipeline: &wgpu::ComputePipeline,
-        inputs: &[(u32, &wgpu::Buffer)],
-        out_binding: u32,
-        count: u32,
-        out_bytes: u64,
-    ) -> Vec<u8> {
-        let out = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: out_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: out_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut entries: Vec<_> = inputs
+    fn bind(&self, pipeline: &wgpu::ComputePipeline, entries: &[(u32, &wgpu::Buffer)]) -> wgpu::BindGroup {
+        let entries: Vec<_> = entries
             .iter()
             .map(|(b, buf)| wgpu::BindGroupEntry { binding: *b, resource: buf.as_entire_binding() })
             .collect();
-        entries.push(wgpu::BindGroupEntry { binding: out_binding, resource: out.as_entire_binding() });
-        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
             entries: &entries,
-        });
+        })
+    }
+
+    pub fn upload(&self, photo: &Photo) -> GpuPhoto {
+        let src = self.storage(bytemuck::cast_slice(&photo.pixels));
+        let (out, staging) = self.output(photo.width as u64 * photo.height as u64 * 4);
+        let preview_bind = self.bind(&self.preview, &[(0, &self.params), (1, &self.curves), (2, &src), (3, &out)]);
+        GpuPhoto { src, out, staging, preview_bind, width: photo.width, height: photo.height }
+    }
+
+    pub fn upload_lut(&self, lut: &Lut3d) -> GpuLut {
+        let data: Vec<[f32; 4]> = lut.data.iter().map(|&[r, g, b]| [r, g, b, 1.0]).collect();
+        GpuLut { buf: self.storage(bytemuck::cast_slice(&data)), size: lut.size as u32 }
+    }
+
+    fn write_params(&self, mut p: Params, w: u32, h: u32, lut_size: u32, split: f32) {
+        (p.width, p.height, p.lut_size, p.split) = (w, h, lut_size, split);
+        self.queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
+    }
+
+    /// Dispatches over `count` items, then copies `out` back through `staging`.
+    fn run(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        bind: &wgpu::BindGroup,
+        count: u32,
+        out: &wgpu::Buffer,
+        staging: &wgpu::Buffer,
+    ) -> Vec<u8> {
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind, &[]);
+            pass.set_bind_group(0, bind, &[]);
             pass.dispatch_workgroups(count.div_ceil(WORKGROUP), 1, 1);
         }
-        enc.copy_buffer_to_buffer(&out, 0, &staging, 0, out_bytes);
+        enc.copy_buffer_to_buffer(out, 0, staging, 0, out.size());
         self.queue.submit([enc.finish()]);
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.expect("GPU readback failed"));
@@ -135,37 +170,28 @@ impl Gpu {
         bytes
     }
 
-    fn params(&self, mut p: Params, w: u32, h: u32, lut_size: u32, split: f32) -> wgpu::Buffer {
-        (p.width, p.height, p.lut_size, p.split) = (w, h, lut_size, split);
-        self.storage(bytemuck::bytes_of(&p))
-    }
-
     /// Graded preview as RGBA8.
     pub fn render(&self, photo: &GpuPhoto, grade: &Grade, split: f32) -> Vec<u8> {
-        let params = self.params(grade.params, photo.width, photo.height, 0, split);
-        let curves = self.storage(bytemuck::cast_slice(&grade.curve_samples()));
-        let n = photo.width * photo.height;
-        self.run(&self.preview, &[(0, &params), (1, &curves), (2, &photo.buf)], 3, n, n as u64 * 4)
-    }
-
-    pub fn upload_lut(&self, lut: &Lut3d) -> GpuLut {
-        let data: Vec<[f32; 4]> = lut.data.iter().map(|&[r, g, b]| [r, g, b, 1.0]).collect();
-        GpuLut { buf: self.storage(bytemuck::cast_slice(&data)), size: lut.size as u32 }
+        self.write_params(grade.params, photo.width, photo.height, 0, split);
+        self.queue.write_buffer(&self.curves, 0, bytemuck::cast_slice(&grade.curve_samples()));
+        self.run(&self.preview, &photo.preview_bind, photo.width * photo.height, &photo.out, &photo.staging)
     }
 
     /// Photo seen through an external LUT (tetrahedral), as RGBA8.
     pub fn apply_lut(&self, photo: &GpuPhoto, lut: &GpuLut, split: f32) -> Vec<u8> {
-        let params = self.params(Params::default(), photo.width, photo.height, lut.size, split);
-        let n = photo.width * photo.height;
-        self.run(&self.apply, &[(0, &params), (2, &photo.buf), (5, &lut.buf)], 3, n, n as u64 * 4)
+        self.write_params(Params::default(), photo.width, photo.height, lut.size, split);
+        let bind = self.bind(&self.apply, &[(0, &self.params), (2, &photo.src), (3, &photo.out), (5, &lut.buf)]);
+        self.run(&self.apply, &bind, photo.width * photo.height, &photo.out, &photo.staging)
     }
 
     /// Evaluates the grade exactly on every lattice point of an N³ cube.
     pub fn bake(&self, grade: &Grade, size: usize, title: String) -> Lut3d {
         let n = (size * size * size) as u32;
-        let params = self.params(grade.params, 0, 0, size as u32, 0.0);
-        let curves = self.storage(bytemuck::cast_slice(&grade.curve_samples()));
-        let bytes = self.run(&self.bake, &[(0, &params), (1, &curves)], 4, n, n as u64 * 16);
+        self.write_params(grade.params, 0, 0, size as u32, 0.0);
+        self.queue.write_buffer(&self.curves, 0, bytemuck::cast_slice(&grade.curve_samples()));
+        let (out, staging) = self.output(n as u64 * 16);
+        let bind = self.bind(&self.bake, &[(0, &self.params), (1, &self.curves), (4, &out)]);
+        let bytes = self.run(&self.bake, &bind, n, &out, &staging);
         let data = bytemuck::cast_slice::<u8, [f32; 4]>(&bytes).iter().map(|&[r, g, b, _]| [r, g, b]).collect();
         Lut3d { title, size, data }
     }
@@ -173,21 +199,14 @@ impl Gpu {
 
 // ------------------------------------------------------------------ worker
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum View {
-    Grade,
-    Compare,
-}
-
 pub enum Job {
     SetPhoto(Photo),
+    /// Uploads the comparison LUTs once; later jobs refer to them by index.
+    SetLuts(Vec<Lut3d>),
     Render(Grade, f32),
-    ApplyLut(Arc<Lut3d>, f32),
+    ApplyLut(usize, f32),
     /// Thumbnails of every LUT; `generation` lets the UI drop stale results.
-    Gallery {
-        generation: u64,
-        luts: Vec<Arc<Lut3d>>,
-    },
+    Gallery(u64),
     Export {
         grade: Grade,
         size: usize,
@@ -196,7 +215,7 @@ pub enum Job {
     },
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Slot {
     Grade,
     Compare,
@@ -209,7 +228,7 @@ impl Job {
         match self {
             Job::Render(..) => Some(Slot::Grade),
             Job::ApplyLut(..) => Some(Slot::Compare),
-            Job::Gallery { .. } => Some(Slot::Gallery),
+            Job::Gallery(..) => Some(Slot::Gallery),
             _ => None,
         }
     }
@@ -219,7 +238,8 @@ impl Job {
 pub enum Done {
     Ready(String),
     Failed(String),
-    Frame { view: View, width: u32, height: u32, rgba: Vec<u8>, scopes: Option<Scopes> },
+    Graded { width: u32, height: u32, rgba: Vec<u8>, scopes: Scopes },
+    Compared { width: u32, height: u32, rgba: Vec<u8> },
     Thumb { generation: u64, index: usize, width: u32, height: u32, rgba: Vec<u8> },
     Exported(Result<PathBuf, String>),
 }
@@ -228,8 +248,7 @@ pub enum Done {
 struct Worker {
     photo: Option<GpuPhoto>,
     thumb: Option<GpuPhoto>,
-    /// Last applied LUT stays on the GPU so split drags don't re-upload it.
-    lut: Option<(Arc<Lut3d>, GpuLut)>,
+    luts: Vec<GpuLut>,
 }
 
 impl Worker {
@@ -239,24 +258,22 @@ impl Worker {
                 self.thumb = Some(gpu.upload(&p.downscaled(THUMB_MAX)));
                 self.photo = Some(gpu.upload(&p));
             }
+            Job::SetLuts(luts) => self.luts = luts.iter().map(|l| gpu.upload_lut(l)).collect(),
             Job::Render(grade, split) => {
                 let Some(ph) = &self.photo else { return };
                 let rgba = gpu.render(ph, &grade, split);
-                let scopes = Some(Scopes::compute(&rgba, ph.width, ph.height, split));
-                notify(Done::Frame { view: View::Grade, width: ph.width, height: ph.height, rgba, scopes });
+                let scopes = Scopes::compute(&rgba, ph.width, ph.height, split);
+                notify(Done::Graded { width: ph.width, height: ph.height, rgba, scopes });
             }
-            Job::ApplyLut(lut, split) => {
-                let Some(ph) = &self.photo else { return };
-                if !self.lut.as_ref().is_some_and(|(l, _)| Arc::ptr_eq(l, &lut)) {
-                    self.lut = Some((lut.clone(), gpu.upload_lut(&lut)));
-                }
-                let rgba = gpu.apply_lut(ph, &self.lut.as_ref().expect("uploaded above").1, split);
-                notify(Done::Frame { view: View::Compare, width: ph.width, height: ph.height, rgba, scopes: None });
+            Job::ApplyLut(index, split) => {
+                let (Some(ph), Some(lut)) = (&self.photo, self.luts.get(index)) else { return };
+                let rgba = gpu.apply_lut(ph, lut, split);
+                notify(Done::Compared { width: ph.width, height: ph.height, rgba });
             }
-            Job::Gallery { generation, luts } => {
+            Job::Gallery(generation) => {
                 let Some(th) = &self.thumb else { return };
-                for (index, lut) in luts.iter().enumerate() {
-                    let rgba = gpu.apply_lut(th, &gpu.upload_lut(lut), 0.0);
+                for (index, lut) in self.luts.iter().enumerate() {
+                    let rgba = gpu.apply_lut(th, lut, 0.0);
                     notify(Done::Thumb { generation, index, width: th.width, height: th.height, rgba });
                 }
             }
@@ -282,17 +299,16 @@ pub fn spawn(notify: impl Fn(Done) + Send + 'static) -> mpsc::Sender<Job> {
             notify(Done::Ready(gpu.name.clone()));
             let mut worker = Worker::default();
             while let Ok(first) = rx.recv() {
-                let mut jobs: Vec<Job> = std::iter::once(first).chain(rx.try_iter()).collect();
-                let superseded = |i: usize, jobs: &[Job]| {
-                    jobs[i].slot().is_some_and(|s| jobs[i + 1..].iter().any(|j| j.slot().as_ref() == Some(&s)))
-                };
-                let keep: Vec<bool> = (0..jobs.len()).map(|i| !superseded(i, &jobs)).collect();
+                // Keep only the newest job per slot, preserving order otherwise.
+                let mut batch: Vec<Job> = std::iter::once(first).chain(rx.try_iter()).collect();
+                let mut seen = [false; 3];
+                batch.reverse();
+                batch.retain(|j| j.slot().is_none_or(|s| !std::mem::replace(&mut seen[s as usize], true)));
+                batch.reverse();
                 // Gallery passes are slow; run them after this batch's previews.
-                let mut order: Vec<usize> = (0..jobs.len()).filter(|&i| keep[i]).collect();
-                order.sort_by_key(|&i| jobs[i].slot() == Some(Slot::Gallery));
-                let mut taken: Vec<Option<Job>> = jobs.drain(..).map(Some).collect();
-                for i in order {
-                    let job = taken[i].take().expect("each job runs once");
+                let (gallery, rest): (Vec<Job>, Vec<Job>) =
+                    batch.into_iter().partition(|j| j.slot() == Some(Slot::Gallery));
+                for job in rest.into_iter().chain(gallery) {
                     // A device loss or validation error panics inside wgpu: report it instead of dying silently.
                     if catch_unwind(AssertUnwindSafe(|| worker.handle(&gpu, job, &notify))).is_err() {
                         return notify(Done::Failed("errore della GPU, riavvia l'applicazione".into()));

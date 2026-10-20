@@ -2,16 +2,16 @@
 
 mod widgets;
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::path::PathBuf;
+use std::sync::mpsc;
 
 use relm4::adw::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk};
-use vibinglut_core::gpu::{self, Done, Job, View};
+use vibinglut_core::gpu::{self, Done, Job};
 use vibinglut_core::grade::{Curve, Grade, Params};
 use vibinglut_core::lut::Lut3d;
-use vibinglut_core::photo::{Photo, RAW_EXTS};
+use vibinglut_core::photo::{Photo, RASTER_EXTS, RAW_EXTS};
 use vibinglut_core::scopes::{HIST_H, HIST_W, Scopes, VEC_SIZE};
 use widgets::{ColorWheel, CurveEditor, Slider};
 
@@ -37,7 +37,8 @@ enum Msg {
     ExportTo(usize, PathBuf),
     ChooseFolder,
     Folder(PathBuf),
-    GalleryLoaded(Vec<Arc<Lut3d>>, Vec<String>),
+    GalleryLoaded(Vec<Lut3d>, Vec<String>),
+    Page(bool),
     SelectLut(usize),
     Gpu(Done),
 }
@@ -48,11 +49,7 @@ struct Ui {
     grade_stack: gtk::Stack,
     grade_pic: gtk::Picture,
     info: gtk::Label,
-    scopes: [gtk::Picture; 3],
-    sliders: Vec<Slider>,
-    wheels: Vec<(ColorWheel, Slider)>,
-    hue: [Slider; 3],
-    curves: CurveEditor,
+    sidebar: Sidebar,
     gallery_stack: gtk::Stack,
     compare_stack: gtk::Stack,
     compare_pic: gtk::Picture,
@@ -68,7 +65,8 @@ struct App {
     compare: bool,
     split: f32,
     path: Option<PathBuf>,
-    luts: Vec<Arc<Lut3d>>,
+    lut_count: usize,
+    on_compare: bool,
     selected: Option<usize>,
     jobs: mpsc::Sender<Job>,
     /// Last preview request; identical requests (e.g. echoes of programmatic
@@ -101,15 +99,20 @@ impl App {
 
     fn render_compare(&self) {
         if let (Some(i), Some(_)) = (self.selected, &self.path) {
-            self.send(Job::ApplyLut(self.luts[i].clone(), self.split_value()));
+            self.send(Job::ApplyLut(i, self.split_value()));
         }
     }
 
     fn render_gallery(&mut self) {
-        if self.path.is_some() && !self.luts.is_empty() {
+        if self.path.is_some() && self.lut_count > 0 {
             self.gallery_gen += 1;
-            self.send(Job::Gallery { generation: self.gallery_gen, luts: self.luts.clone() });
+            self.send(Job::Gallery(self.gallery_gen));
         }
+    }
+
+    /// Renders only the view on screen; the other one refreshes when shown.
+    fn refresh(&mut self) {
+        if self.on_compare { self.render_compare() } else { self.render() }
     }
 
     fn toast(&self, text: &str) {
@@ -318,13 +321,10 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     let hsl = vbox(6);
     let band_name = gtk::Label::builder().label(BANDS[0].0).css_classes(["caption-heading"]).build();
     let dots = gtk::Box::builder().spacing(6).halign(gtk::Align::Center).build();
-    let provider = gtk::CssProvider::new();
-    let mut dot_css = String::new();
     let mut first: Option<gtk::ToggleButton> = None;
-    for (i, (name, hex)) in BANDS.iter().enumerate() {
+    for (i, (name, _)) in BANDS.iter().enumerate() {
         let b = gtk::ToggleButton::builder().tooltip_text(*name).css_classes(["band", &format!("band-{i}")]).build();
         b.update_property(&[gtk::accessible::Property::Label(name)]);
-        dot_css.push_str(&format!(".band-{i} {{ background: {hex}; }}\n"));
         match &first {
             None => {
                 b.set_active(true);
@@ -341,12 +341,6 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
         });
         dots.append(&b);
     }
-    provider.load_from_string(&dot_css);
-    gtk::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("display"),
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
     hsl.append(&dots);
     hsl.append(&band_name);
     let hue: [Slider; 3] = std::array::from_fn(|k| {
@@ -446,13 +440,6 @@ impl SimpleComponent for App {
     fn init(init: Self::Init, window: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         // Neutral dark surround is the colourist standard.
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::PreferDark);
-        let css = gtk::CssProvider::new();
-        css.load_from_string(CSS);
-        gtk::style_context_add_provider_for_display(
-            &gtk::prelude::WidgetExt::display(&window),
-            &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
 
         let snd = sender.clone();
         let jobs = gpu::spawn(move |d| snd.input(Msg::Gpu(d)));
@@ -489,14 +476,14 @@ impl SimpleComponent for App {
         grade_stack.add_named(&loading, Some("loading"));
         grade_stack.add_named(&canvas, Some("image"));
 
-        let Sidebar { scroll: sidebar, sliders, wheels, hue, curves, scopes } = build_sidebar(&sender);
+        let sidebar = build_sidebar(&sender);
         let grade_split = adw::OverlaySplitView::builder()
             .sidebar_position(gtk::PackType::End)
             .min_sidebar_width(340.0)
             .max_sidebar_width(420.0)
             .sidebar_width_fraction(0.28)
             .content(&grade_stack)
-            .sidebar(&sidebar)
+            .sidebar(&sidebar.scroll)
             .build();
 
         // ---------------- compare page
@@ -588,6 +575,10 @@ impl SimpleComponent for App {
         let stack = adw::ViewStack::new();
         stack.add_titled_with_icon(&grade_split, Some("grade"), "Grade", "color-select-symbolic");
         stack.add_titled_with_icon(&compare_split, Some("compare"), "Confronta LUT", "view-grid-symbolic");
+        let snd = sender.clone();
+        stack.connect_visible_child_name_notify(move |s| {
+            snd.input(Msg::Page(s.visible_child_name().as_deref() == Some("compare")));
+        });
 
         let header = adw::HeaderBar::new();
         let switcher = adw::ViewSwitcher::builder().stack(&stack).policy(adw::ViewSwitcherPolicy::Wide).build();
@@ -751,7 +742,8 @@ impl SimpleComponent for App {
             compare: false,
             split: 0.5,
             path: None,
-            luts: Vec::new(),
+            lut_count: 0,
+            on_compare: false,
             selected: None,
             jobs,
             sent: None,
@@ -763,11 +755,7 @@ impl SimpleComponent for App {
                 grade_stack,
                 grade_pic,
                 info,
-                scopes,
-                sliders,
-                wheels,
-                hue,
-                curves,
+                sidebar,
                 gallery_stack,
                 compare_stack,
                 compare_pic,
@@ -787,8 +775,7 @@ impl SimpleComponent for App {
         match msg {
             Msg::Open => {
                 // add_suffix matches case-insensitively.
-                let pats: Vec<String> =
-                    ["jpg", "jpeg", "png", "tif", "tiff"].iter().chain(RAW_EXTS).map(|s| s.to_string()).collect();
+                let pats: Vec<String> = RASTER_EXTS.iter().chain(RAW_EXTS).map(|s| s.to_string()).collect();
                 let dialog = gtk::FileDialog::builder()
                     .title("Apri foto")
                     .filters(&file_filters("Foto e RAW", &pats))
@@ -820,9 +807,8 @@ impl SimpleComponent for App {
                 self.sent = None;
                 self.ui.export.set_sensitive(true);
                 self.ui.grade_stack.set_visible_child_name("image");
-                self.render();
+                self.refresh();
                 self.render_gallery();
-                self.render_compare();
             }
             Msg::Loaded(_, path, Err(e)) => {
                 self.ui.grade_stack.set_visible_child_name(if self.path.is_some() { "image" } else { "empty" });
@@ -845,7 +831,7 @@ impl SimpleComponent for App {
                 self.band = b;
                 // The resulting Hue echoes carry unchanged values, so render() skips them.
                 let p = self.grade.params;
-                for (s, v) in self.ui.hue.iter().zip([p.hue_shift[b], p.hue_sat[b], p.hue_lum[b]]) {
+                for (s, v) in self.ui.sidebar.hue.iter().zip([p.hue_shift[b], p.hue_sat[b], p.hue_lum[b]]) {
                     s.adj.set_value(v as f64);
                 }
             }
@@ -864,25 +850,23 @@ impl SimpleComponent for App {
                 self.render();
             }
             Msg::ResetAll => {
-                self.ui.sliders.iter().chain(&self.ui.hue).for_each(Slider::reset);
-                for (w, l) in &self.ui.wheels {
+                self.ui.sidebar.sliders.iter().chain(&self.ui.sidebar.hue).for_each(Slider::reset);
+                for (w, l) in &self.ui.sidebar.wheels {
                     w.set(0.0, 0.0);
                     l.reset();
                 }
-                self.ui.curves.reset_all();
+                self.ui.sidebar.curves.reset_all();
                 self.grade = Grade::default();
                 self.render();
             }
             Msg::Compare(on) => {
                 self.compare = on;
-                self.render();
-                self.render_compare();
+                self.refresh();
             }
             Msg::Split(x) => {
                 if self.compare {
                     self.split = x;
-                    self.render();
-                    self.render_compare();
+                    self.refresh();
                 }
             }
             Msg::Export(size) => {
@@ -920,7 +904,7 @@ impl SimpleComponent for App {
                     .set_label(&dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
                 let s = sender.input_sender().clone();
                 std::thread::spawn(move || {
-                    let (luts, errors) = load_folder(&dir);
+                    let (luts, errors) = Lut3d::load_dir(&dir);
                     s.emit(Msg::GalleryLoaded(luts, errors));
                 });
             }
@@ -928,9 +912,7 @@ impl SimpleComponent for App {
                 if !errors.is_empty() {
                     self.toast(&format!("{} file ignorati: {}", errors.len(), errors.join("; ")));
                 }
-                while let Some(c) = self.ui.flow.first_child() {
-                    self.ui.flow.remove(&c);
-                }
+                self.ui.flow.remove_all();
                 self.ui.thumbs.clear();
                 for lut in &luts {
                     let pic = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).height_request(96).build();
@@ -949,7 +931,8 @@ impl SimpleComponent for App {
                     self.ui.thumbs.push(pic);
                 }
                 self.ui.gallery_stack.set_visible_child_name(if luts.is_empty() { "empty" } else { "grid" });
-                self.luts = luts;
+                self.lut_count = luts.len();
+                self.send(Job::SetLuts(luts));
                 self.selected = None;
                 self.ui.compare_stack.set_visible_child_name("empty");
                 self.render_gallery();
@@ -958,10 +941,14 @@ impl SimpleComponent for App {
                 }
             }
             Msg::SelectLut(i) => {
-                if i < self.luts.len() && self.selected != Some(i) {
+                if i < self.lut_count && self.selected != Some(i) {
                     self.selected = Some(i);
                     self.render_compare();
                 }
+            }
+            Msg::Page(compare) => {
+                self.on_compare = compare;
+                self.refresh();
             }
             Msg::Gpu(done) => self.on_gpu(done),
         }
@@ -973,21 +960,16 @@ impl App {
         match done {
             Done::Ready(name) => self.toast(&format!("GPU: {name}")),
             Done::Failed(e) => self.toast(&format!("GPU non disponibile: {e}")),
-            Done::Frame { view, width, height, rgba, scopes } => {
-                let tex = texture(width, height, rgba);
-                match view {
-                    View::Grade => self.ui.grade_pic.set_paintable(Some(&tex)),
-                    View::Compare => {
-                        self.ui.compare_pic.set_paintable(Some(&tex));
-                        self.ui.compare_stack.set_visible_child_name("image");
-                    }
-                }
-                if let Some(Scopes { histogram, waveform, vectorscope }) = scopes {
-                    let [h, w, v] = &self.ui.scopes;
-                    h.set_paintable(Some(&texture(HIST_W as u32, HIST_H as u32, histogram)));
-                    w.set_paintable(Some(&texture(HIST_W as u32, HIST_H as u32, waveform)));
-                    v.set_paintable(Some(&texture(VEC_SIZE as u32, VEC_SIZE as u32, vectorscope)));
-                }
+            Done::Graded { width, height, rgba, scopes: Scopes { histogram, waveform, vectorscope } } => {
+                self.ui.grade_pic.set_paintable(Some(&texture(width, height, rgba)));
+                let [h, w, v] = &self.ui.sidebar.scopes;
+                h.set_paintable(Some(&texture(HIST_W as u32, HIST_H as u32, histogram)));
+                w.set_paintable(Some(&texture(HIST_W as u32, HIST_H as u32, waveform)));
+                v.set_paintable(Some(&texture(VEC_SIZE as u32, VEC_SIZE as u32, vectorscope)));
+            }
+            Done::Compared { width, height, rgba } => {
+                self.ui.compare_pic.set_paintable(Some(&texture(width, height, rgba)));
+                self.ui.compare_stack.set_visible_child_name("image");
             }
             Done::Thumb { generation, index, width, height, rgba } => {
                 if generation != self.gallery_gen {
@@ -1014,25 +996,6 @@ fn wheel_mut(p: &mut Params, i: usize) -> &mut [f32; 4] {
     }
 }
 
-fn load_folder(dir: &Path) -> (Vec<Arc<Lut3d>>, Vec<String>) {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("cube")))
-                .collect()
-        })
-        .unwrap_or_default();
-    paths.sort();
-    let (mut luts, mut errors) = (Vec::new(), Vec::new());
-    for p in paths {
-        match Lut3d::load(&p) {
-            Ok(l) => luts.push(Arc::new(l)),
-            Err(e) => errors.push(format!("{}: {e}", p.file_name().unwrap_or_default().to_string_lossy())),
-        }
-    }
-    (luts, errors)
-}
-
 fn shortcuts_dialog() -> adw::ShortcutsDialog {
     let dialog = adw::ShortcutsDialog::new();
     let section = adw::ShortcutsSection::new(None);
@@ -1052,5 +1015,9 @@ fn shortcuts_dialog() -> adw::ShortcutsDialog {
 
 fn main() {
     let file = std::env::args().nth(1).map(PathBuf::from);
-    RelmApp::new(APP_ID).with_args(Vec::new()).run::<App>(file);
+    let app = RelmApp::new(APP_ID).with_args(Vec::new());
+    let bands: String =
+        BANDS.iter().enumerate().map(|(i, (_, hex))| format!(".band-{i} {{ background: {hex}; }}\n")).collect();
+    relm4::set_global_css(&format!("{CSS}{bands}"));
+    app.run::<App>(file);
 }

@@ -37,15 +37,15 @@ impl Lut3d {
                 Some("TITLE") => title = line[5..].trim().trim_matches('"').to_string(),
                 Some("LUT_3D_SIZE") => size = it.next().and_then(|v| v.parse().ok()).ok_or("bad LUT_3D_SIZE")?,
                 Some("LUT_1D_SIZE") => return Err("1D LUTs are not supported".into()),
-                Some("DOMAIN_MIN") | Some("DOMAIN_MAX") => {
+                Some(k @ ("DOMAIN_MIN" | "DOMAIN_MAX")) => {
                     // ponytail: only the standard 0..1 domain; rescale here if a shaper-domain LUT ever shows up.
-                    let want = if line.starts_with("DOMAIN_MIN") { 0.0 } else { 1.0 };
+                    let want = if k == "DOMAIN_MIN" { 0.0 } else { 1.0 };
                     if it.any(|v| v.parse::<f32>().map_or(true, |v| (v - want).abs() > 1e-6)) {
                         return Err("non-standard DOMAIN is not supported".into());
                     }
                 }
                 Some(first) if first.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '.') => {
-                    let v: Vec<f32> = line.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+                    let v: Vec<f32> = std::iter::once(first).chain(it).filter_map(|v| v.parse().ok()).collect();
                     if v.len() != 3 {
                         return Err(format!("bad data line: {line}"));
                     }
@@ -66,6 +66,26 @@ impl Lut3d {
         // TITLE lines are wildly inconsistent in the wild; the file name is what users recognise.
         lut.title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(lut.title);
         Ok(lut)
+    }
+
+    /// Every `.cube` in `dir`, sorted by name, plus one message per file that failed to parse.
+    pub fn load_dir(dir: &Path) -> (Vec<Self>, Vec<String>) {
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("cube")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        paths.sort();
+        let (mut luts, mut errors) = (Vec::new(), Vec::new());
+        for p in paths {
+            match Self::load(&p) {
+                Ok(l) => luts.push(l),
+                Err(e) => errors.push(format!("{}: {e}", p.file_name().unwrap_or_default().to_string_lossy())),
+            }
+        }
+        (luts, errors)
     }
 }
 

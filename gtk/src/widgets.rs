@@ -103,9 +103,23 @@ pub struct CurveEditor {
     state: Rc<RefCell<CurveState>>,
 }
 
+/// Plot size inside the padding.
+fn inner(area: &gtk::DrawingArea) -> (f64, f64) {
+    (area.width() as f64 - 2.0 * PAD, area.height() as f64 - 2.0 * PAD)
+}
+
 fn to_curve(area: &gtk::DrawingArea, x: f64, y: f64) -> (f64, f64) {
-    let (w, h) = (area.width() as f64 - 2.0 * PAD, area.height() as f64 - 2.0 * PAD);
+    let (w, h) = inner(area);
     (((x - PAD) / w).clamp(0.0, 1.0), (1.0 - (y - PAD) / h).clamp(0.0, 1.0))
+}
+
+/// Index (within `range`) of the control point under widget position (x, y).
+fn hit(area: &gtk::DrawingArea, pts: &[(f32, f32)], range: std::ops::Range<usize>, x: f64, y: f64) -> Option<usize> {
+    let (w, h) = inner(area);
+    range.into_iter().find(|&i| {
+        let (sx, sy) = (PAD + pts[i].0 as f64 * w, PAD + (1.0 - pts[i].1 as f64) * h);
+        (sx - x).hypot(sy - y) < HIT_RADIUS
+    })
 }
 
 impl CurveEditor {
@@ -126,34 +140,31 @@ impl CurveEditor {
         {
             let (s, a, f) = (state.clone(), area.clone(), on_change.clone());
             drag.connect_drag_begin(move |_, x, y| {
-                let mut st = s.borrow_mut();
-                let (w, h) = (a.width() as f64 - 2.0 * PAD, a.height() as f64 - 2.0 * PAD);
-                let ch = st.active;
-                let hit = st.curves[ch].iter().position(|&(px, py)| {
-                    let (sx, sy) = (PAD + px as f64 * w, PAD + (1.0 - py as f64) * h);
-                    (sx - x).hypot(sy - y) < HIT_RADIUS
-                });
-                let idx = match hit {
-                    Some(i) => i,
-                    None => {
-                        let (cx, cy) = to_curve(&a, x, y);
-                        let pts = &mut st.curves[ch];
-                        let i = pts.iter().position(|p| p.0 as f64 > cx).unwrap_or(pts.len() - 1).max(1);
-                        // Keep a minimum gap so neighbours never collapse onto one x.
-                        if cx - (pts[i - 1].0 as f64) < MIN_GAP || (pts[i].0 as f64) - cx < MIN_GAP {
-                            return;
+                let inserted = {
+                    let mut st = s.borrow_mut();
+                    let ch = st.active;
+                    let pts = &mut st.curves[ch];
+                    let (idx, inserted) = match hit(&a, pts, 0..pts.len(), x, y) {
+                        Some(i) => (i, None),
+                        None => {
+                            let (cx, cy) = to_curve(&a, x, y);
+                            let i = pts.iter().position(|p| p.0 as f64 > cx).unwrap_or(pts.len() - 1).max(1);
+                            // Keep a minimum gap so neighbours never collapse onto one x.
+                            if cx - (pts[i - 1].0 as f64) < MIN_GAP || (pts[i].0 as f64) - cx < MIN_GAP {
+                                return;
+                            }
+                            pts.insert(i, (cx as f32, cy as f32));
+                            (i, Some((ch, pts.clone())))
                         }
-                        pts.insert(i, (cx as f32, cy as f32));
-                        let curve = pts.clone();
-                        drop(st);
-                        a.queue_draw();
-                        f(ch, curve);
-                        st = s.borrow_mut();
-                        i
-                    }
+                    };
+                    let p = pts[idx];
+                    st.drag = Some((idx, p.0 as f64, p.1 as f64));
+                    inserted
                 };
-                let p = st.curves[ch][idx];
-                st.drag = Some((idx, p.0 as f64, p.1 as f64));
+                if let Some((ch, curve)) = inserted {
+                    a.queue_draw();
+                    f(ch, curve);
+                }
             });
         }
         {
@@ -162,7 +173,7 @@ impl CurveEditor {
                 let (ch, curve) = {
                     let mut st = s.borrow_mut();
                     let Some((i, x0, y0)) = st.drag else { return };
-                    let (w, h) = (a.width() as f64 - 2.0 * PAD, a.height() as f64 - 2.0 * PAD);
+                    let (w, h) = inner(&a);
                     let ch = st.active;
                     let pts = &mut st.curves[ch];
                     let last = pts.len() - 1;
@@ -196,16 +207,9 @@ impl CurveEditor {
                 }
                 let (ch, curve) = {
                     let mut st = s.borrow_mut();
-                    let (w, h) = (a.width() as f64 - 2.0 * PAD, a.height() as f64 - 2.0 * PAD);
                     let ch = st.active;
                     let pts = &mut st.curves[ch];
-                    let last = pts.len() - 1;
-                    let Some(i) = (1..last).find(|&i| {
-                        let (sx, sy) = (PAD + pts[i].0 as f64 * w, PAD + (1.0 - pts[i].1 as f64) * h);
-                        (sx - x).hypot(sy - y) < HIT_RADIUS
-                    }) else {
-                        return;
-                    };
+                    let Some(i) = hit(&a, pts, 1..pts.len() - 1, x, y) else { return };
                     pts.remove(i);
                     st.drag = None;
                     (ch, st.curves[ch].clone())
@@ -297,14 +301,6 @@ pub struct ColorWheel {
     on_change: Rc<dyn Fn(f32, f32)>,
 }
 
-fn hsv(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
-    let f = |n: f64| {
-        let k = (n + h * 6.0) % 6.0;
-        v - v * s * (k.min(4.0 - k).clamp(0.0, 1.0))
-    };
-    (f(5.0), f(3.0), f(1.0))
-}
-
 impl ColorWheel {
     pub fn new(name: &str, on_change: impl Fn(f32, f32) + 'static) -> Self {
         let area = gtk::DrawingArea::builder()
@@ -320,21 +316,14 @@ impl ColorWheel {
         let this = Self { area: area.clone(), pos, on_change: Rc::new(on_change) };
 
         let drag = gtk::GestureDrag::new();
-        let start = Rc::new(RefCell::new((0.0, 0.0)));
-        {
-            let (t, st) = (this.clone(), start.clone());
-            drag.connect_drag_begin(move |_, x, y| {
-                *st.borrow_mut() = (x, y);
-                t.set_from_widget(x, y);
-            });
-        }
-        {
-            let (t, st) = (this.clone(), start.clone());
-            drag.connect_drag_update(move |_, dx, dy| {
-                let (x, y) = *st.borrow();
+        let t = this.clone();
+        drag.connect_drag_begin(move |_, x, y| t.set_from_widget(x, y));
+        let t = this.clone();
+        drag.connect_drag_update(move |g, dx, dy| {
+            if let Some((x, y)) = g.start_point() {
                 t.set_from_widget(x + dx, y + dy);
-            });
-        }
+            }
+        });
         area.add_controller(drag);
         let dbl = gtk::GestureClick::new();
         let t = this.clone();
@@ -372,8 +361,8 @@ fn draw_wheel(cr: &cairo::Context, w: f64, h: f64, (px, py): (f64, f64)) {
     for i in 0..SEGMENTS {
         let a0 = i as f64 / SEGMENTS as f64 * TAU;
         let a1 = (i + 1) as f64 / SEGMENTS as f64 * TAU + 0.01;
-        let (r_, g, b) = hsv(a0 / TAU, 0.75, 0.85);
-        cr.set_source_rgb(r_, g, b);
+        let (r_, g, b) = gtk::hsv_to_rgb((a0 / TAU) as f32, 0.75, 0.85);
+        cr.set_source_rgb(r_ as f64, g as f64, b as f64);
         cr.move_to(cx, cy);
         // Screen y points down, so negate angles to keep hue counter-clockwise.
         cr.arc_negative(cx, cy, r, -a0, -a1);

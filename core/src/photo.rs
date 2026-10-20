@@ -4,13 +4,15 @@
 
 use std::path::Path;
 
-use image::{DynamicImage, ImageDecoder, ImageReader};
-use rawler::decoders::Orientation;
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, ImageReader, Rgba32FImage};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
+use rawler::imgop::srgb::srgb_apply_gamma;
 
 pub const PREVIEW_MAX: u32 = 2048;
 pub const THUMB_MAX: u32 = 384;
 
+pub const RASTER_EXTS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff"];
 pub const RAW_EXTS: &[&str] = &[
     "rw2", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "dng", "pef", "srw", "iiq", "3fr", "erf",
     "kdc", "mrw", "rwl",
@@ -36,30 +38,23 @@ impl Photo {
         if RAW_EXTS.contains(&ext.as_str()) { load_raw(path) } else { load_raster(path) }
     }
 
-    /// Box-filtered copy that fits in `max` × `max`.
+    /// Area-averaged copy that fits in `max` × `max`, keeping the aspect ratio.
     pub fn downscaled(&self, max: u32) -> Self {
-        let f = self.width.max(self.height).div_ceil(max).max(1);
-        if f == 1 {
+        let scale = max as f32 / self.width.max(self.height) as f32;
+        if scale >= 1.0 {
             return self.clone();
         }
-        let (w, h) = ((self.width / f).max(1), (self.height / f).max(1));
-        let mut pixels = Vec::with_capacity((w * h) as usize);
-        let norm = 1.0 / (f * f) as f32;
-        for y in 0..h {
-            for x in 0..w {
-                let mut acc = [0.0f32; 4];
-                for dy in 0..f {
-                    let row = ((y * f + dy) * self.width + x * f) as usize;
-                    for p in &self.pixels[row..row + f as usize] {
-                        for c in 0..4 {
-                            acc[c] += p[c];
-                        }
-                    }
-                }
-                pixels.push(acc.map(|v| v * norm));
-            }
-        }
-        Self { width: w, height: h, pixels }
+        let dim = |v: u32| ((v as f32 * scale).round() as u32).max(1);
+        Self::from_image(image::imageops::thumbnail(&self.to_image(), dim(self.width), dim(self.height)))
+    }
+
+    fn to_image(&self) -> Rgba32FImage {
+        Rgba32FImage::from_raw(self.width, self.height, bytemuck::cast_slice(&self.pixels).to_vec())
+            .expect("pixel count matches dimensions")
+    }
+
+    fn from_image(img: Rgba32FImage) -> Self {
+        Self { width: img.width(), height: img.height(), pixels: bytemuck::cast_slice(img.as_raw()).to_vec() }
     }
 }
 
@@ -97,7 +92,10 @@ fn load_raw(path: &Path) -> Result<Photo, String> {
     let (w, h) = (rgb.dim().w as u32, rgb.dim().h as u32);
     let linear = Photo { width: w, height: h, pixels: rgb.data.iter().map(|p| [p[0], p[1], p[2], 1.0]).collect() };
     // Downscale in linear light (physically correct averaging), then encode.
-    let mut photo = orient(linear.downscaled(PREVIEW_MAX), raw.orientation);
+    let orientation = Orientation::from_exif(raw.orientation.to_u16() as u8).unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::ImageRgba32F(linear.downscaled(PREVIEW_MAX).to_image());
+    img.apply_orientation(orientation);
+    let mut photo = Photo::from_image(img.into_rgba32f());
     for p in &mut photo.pixels {
         let [r, g, b] = base_look([p[0], p[1], p[2]]);
         *p = [r, g, b, 1.0];
@@ -115,31 +113,5 @@ fn base_look(c: [f32; 3]) -> [f32; 3] {
     let c = c.map(|v| v.max(0.0) * EXPOSURE);
     let m = c[0].max(c[1]).max(c[2]);
     let k = if m > 0.0 { (1.0 + m / (WHITE * WHITE)) / (1.0 + m) } else { 0.0 };
-    c.map(|v| srgb_encode((v * k).min(1.0)))
-}
-
-fn srgb_encode(v: f32) -> f32 {
-    if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
-}
-
-fn orient(p: Photo, o: Orientation) -> Photo {
-    use Orientation::*;
-    if matches!(o, Normal | Unknown) {
-        return p;
-    }
-    let (w, h) = (p.width as usize, p.height as usize);
-    let (ow, oh) = if matches!(o, Transpose | Rotate90 | Transverse | Rotate270) { (h, w) } else { (w, h) };
-    // Source index for output pixel (x, y), per EXIF orientation.
-    let src = |x: usize, y: usize| match o {
-        HorizontalFlip => y * w + (w - 1 - x),
-        Rotate180 => (h - 1 - y) * w + (w - 1 - x),
-        VerticalFlip => (h - 1 - y) * w + x,
-        Transpose => x * w + y,
-        Rotate90 => (h - 1 - x) * w + y,
-        Transverse => (h - 1 - x) * w + (w - 1 - y),
-        Rotate270 => x * w + (w - 1 - y),
-        Normal | Unknown => y * w + x,
-    };
-    let pixels = (0..oh).flat_map(|y| (0..ow).map(move |x| (x, y))).map(|(x, y)| p.pixels[src(x, y)]).collect();
-    Photo { width: ow as u32, height: oh as u32, pixels }
+    c.map(|v| srgb_apply_gamma((v * k).min(1.0)))
 }
