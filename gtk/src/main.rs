@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use relm4::adw::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk};
+use vibinglut_core::chart::test_chart;
 use vibinglut_core::gpu::{self, Done, Job};
 use vibinglut_core::grade::{Curve, Grade, Params};
 use vibinglut_core::lut::{Format, Lut3d, VLT_SIZE};
@@ -44,6 +45,8 @@ enum Msg {
     Group(u32),
     Preferences,
     Page(bool),
+    Chart(bool),
+    ChartReady(Profile, Photo),
     Profile(Profile),
     SelectLut(usize),
     Gpu(Done),
@@ -66,6 +69,7 @@ struct Ui {
     prefs_row: adw::ActionRow,
     thumbs: Vec<gtk::Picture>,
     export: adw::SplitButton,
+    chart_btn: gtk::ToggleButton,
 }
 
 struct App {
@@ -83,6 +87,12 @@ struct App {
     profile: Profile,
     /// Last photo asked for (it may still be loading).
     requested: Option<PathBuf>,
+    /// Loaded photo and the profile it was encoded in; kept so the test
+    /// chart can be swapped in and out.
+    photo: Option<(Photo, Profile)>,
+    photo_info: String,
+    chart: Option<(Photo, Profile)>,
+    show_chart: bool,
     selected: Option<usize>,
     jobs: mpsc::Sender<Job>,
     /// Last preview request; identical requests (e.g. echoes of programmatic
@@ -105,22 +115,41 @@ impl App {
         }
     }
 
+    fn has_source(&self) -> bool {
+        if self.show_chart { self.chart.is_some() } else { self.photo.is_some() }
+    }
+
+    /// Sends the active source (photo or test chart) to the GPU and redraws.
+    fn show_source(&mut self) {
+        let Some((img, profile)) = (if self.show_chart { &self.chart } else { &self.photo }) else { return };
+        // The shader decodes the profile the pixels were actually encoded in.
+        self.grade.params.set_input(*profile);
+        let info = if self.show_chart { format!("Test chart · {}", profile.name()) } else { self.photo_info.clone() };
+        self.ui.info.set_label(&info);
+        self.send(Job::SetPhoto(img.clone()));
+        self.sent = None;
+        self.ui.export.set_sensitive(true);
+        self.ui.grade_stack.set_visible_child_name("image");
+        self.refresh();
+        self.render_gallery();
+    }
+
     fn render(&mut self) {
         let req = Some((self.grade.clone(), self.split_value()));
-        if self.path.is_some() && self.sent != req {
+        if self.has_source() && self.sent != req {
             self.send(Job::Render(self.grade.clone(), self.split_value()));
             self.sent = req;
         }
     }
 
     fn render_compare(&self) {
-        if let (Some(i), Some(_)) = (self.selected, &self.path) {
+        if let (Some(i), true) = (self.selected, self.has_source()) {
             self.send(Job::ApplyLut(i, self.split_value()));
         }
     }
 
     fn render_gallery(&mut self) {
-        if self.path.is_some() && self.lut_count > 0 {
+        if self.has_source() && self.lut_count > 0 {
             self.gallery_gen += 1;
             self.send(Job::Gallery(self.gallery_gen));
         }
@@ -633,6 +662,13 @@ impl SimpleComponent for App {
         let snd = sender.clone();
         open.connect_clicked(move |_| snd.input(Msg::Open));
         header.pack_start(&open);
+        let chart_btn = gtk::ToggleButton::builder()
+            .icon_name("applications-science-symbolic")
+            .tooltip_text("Test chart: mostra cosa fa il LUT a neutri, tinte e pelli (T)")
+            .build();
+        let snd = sender.clone();
+        chart_btn.connect_toggled(move |b| snd.input(Msg::Chart(b.is_active())));
+        header.pack_start(&chart_btn);
 
         let menu = gio::Menu::new();
         let bg_menu = gio::Menu::new();
@@ -805,6 +841,8 @@ impl SimpleComponent for App {
         shortcut("<Control>o", Box::new(move || snd.input(Msg::Open)));
         let e = export.clone();
         shortcut("<Control>e", Box::new(move || e.emit_clicked()));
+        let c = chart_btn.clone();
+        shortcut("t", Box::new(move || c.set_active(!c.is_active())));
         let c = compare_btn.clone();
         shortcut("backslash", Box::new(move || c.set_active(!c.is_active())));
         let s = stack.clone();
@@ -842,6 +880,10 @@ impl SimpleComponent for App {
             on_compare: false,
             profile: Profile::Standard,
             requested: None,
+            photo: None,
+            photo_info: String::new(),
+            chart: None,
+            show_chart: false,
             selected: None,
             jobs,
             sent: None,
@@ -864,6 +906,7 @@ impl SimpleComponent for App {
                 prefs_row,
                 thumbs: Vec::new(),
                 export,
+                chart_btn,
             },
         };
         if let Some(p) = init {
@@ -906,21 +949,13 @@ impl SimpleComponent for App {
             Msg::Loaded(_, path, profile, Ok(photo)) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.ui.window.set_title(Some(&format!("{name} — VibingLUT")));
-                self.ui.info.set_label(&format!(
-                    "{name} · {} · {}×{} anteprima",
-                    profile.name(),
-                    photo.width,
-                    photo.height
-                ));
-                // The shader decodes the profile the pixels were actually encoded in.
-                self.grade.params.set_input(profile);
-                self.send(Job::SetPhoto(photo));
+                self.photo_info = format!("{name} · {} · {}×{} anteprima", profile.name(), photo.width, photo.height);
+                self.photo = Some((photo, profile));
                 self.path = Some(path);
-                self.sent = None;
-                self.ui.export.set_sensitive(true);
-                self.ui.grade_stack.set_visible_child_name("image");
-                self.refresh();
-                self.render_gallery();
+                // Opening a photo means you want to see it.
+                self.show_chart = false;
+                self.ui.chart_btn.set_active(false);
+                self.show_source();
             }
             Msg::Loaded(_, path, _, Err(e)) => {
                 self.ui.grade_stack.set_visible_child_name(if self.path.is_some() { "image" } else { "empty" });
@@ -990,7 +1025,7 @@ impl SimpleComponent for App {
                         let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                         format!("{stem}_{}_{size}", self.profile.tag())
                     }
-                    (None, false) => return,
+                    (None, false) => format!("chart_{}_{size}", self.profile.tag()),
                 };
                 let label = format!("{} {size}³", format.badge());
                 let dialog = gtk::FileDialog::builder()
@@ -1124,6 +1159,28 @@ impl SimpleComponent for App {
                 if let Some(path) = self.requested.clone() {
                     sender.input(Msg::OpenPath(path));
                 }
+                if self.show_chart {
+                    sender.input(Msg::Chart(true));
+                }
+            }
+            Msg::Chart(on) => {
+                self.show_chart = on;
+                match &self.chart {
+                    // The chart is encoded per profile; (re)build it off the main thread.
+                    Some((_, p)) if !on || *p == self.profile => self.show_source(),
+                    _ => {
+                        let (s, profile) = (sender.input_sender().clone(), self.profile);
+                        std::thread::spawn(move || s.emit(Msg::ChartReady(profile, test_chart(profile))));
+                    }
+                }
+            }
+            Msg::ChartReady(profile, chart) => {
+                if profile == self.profile {
+                    self.chart = Some((chart, profile));
+                    if self.show_chart {
+                        self.show_source();
+                    }
+                }
             }
             Msg::Page(compare) => {
                 self.on_compare = compare;
@@ -1193,6 +1250,7 @@ fn shortcuts_dialog() -> adw::ShortcutsDialog {
         ("Apri foto", "<Control>o"),
         ("Esporta LUT", "<Control>e"),
         ("Prima / dopo", "backslash"),
+        ("Test chart", "t"),
         ("Vista Grade", "<Alt>1"),
         ("Vista Confronta LUT", "<Alt>2"),
         ("Preferenze", "<Control>comma"),

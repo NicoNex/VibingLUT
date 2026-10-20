@@ -151,3 +151,21 @@ pub fn view_transform(lin: [f32; 3]) -> [f32; 3] {
     let k = if m > 0.0 { (1.0 + m / (VIEW_WHITE * VIEW_WHITE)) / (1.0 + m) } else { 0.0 };
     c.map(|v| srgb_apply_gamma((v * k).min(1.0)))
 }
+
+/// Exact inverse of [`view_transform`] before its sRGB step: display-linear
+/// Rec.709 in, scene-linear out (the shoulder's quadratic solved for m).
+pub fn inverse_view_transform(display_linear: [f32; 3]) -> [f32; 3] {
+    let y = display_linear.iter().copied().fold(0.0f32, f32::max).min(1.0);
+    if y <= 0.0 {
+        return [0.0; 3];
+    }
+    let w2 = VIEW_WHITE * VIEW_WHITE;
+    // m²/W² + m(1 − y) − y = 0
+    let m = (-(1.0 - y) + ((1.0 - y) * (1.0 - y) + 4.0 * y / w2).sqrt()) * w2 / 2.0;
+    display_linear.map(|v| v.max(0.0) / y * m / VIEW_EXPOSURE)
+}
+
+/// sRGB EOTF (inverse of `srgb_apply_gamma`).
+pub fn srgb_decode(v: f32) -> f32 {
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
