@@ -8,7 +8,7 @@ struct Params {
     saturation: f32, vibrance: f32, sat_shadows: f32, sat_highlights: f32,
     lift: array<f32, 4>, gamma: array<f32, 4>, gain: array<f32, 4>, offset: array<f32, 4>,
     hue_shift: array<f32, 8>, hue_sat: array<f32, 8>, hue_lum: array<f32, 8>,
-    split: f32, width: u32, height: u32, lut_size: u32,
+    input: u32, split: f32, width: u32, height: u32, lut_size: u32,
 }
 
 @group(0) @binding(0) var<storage, read> p: Params;
@@ -32,6 +32,35 @@ fn srgb_to_lin(c: vec3<f32>) -> vec3<f32> {
 fn lin_to_srgb(c: vec3<f32>) -> vec3<f32> {
     let x = max(c, vec3(0.0));
     return select(1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055, x * 12.92, x <= vec3(0.0031308));
+}
+
+// ---------------------------------------------------------- input profile
+// V-Log input is scene-referred: decode it, move V-Gamut to Rec.709 and apply
+// the same neutral view transform used for RAW (photo.rs), so the grade below
+// always starts from a display-referred Rec.709 image.
+
+const VGAMUT_TO_709 = mat3x3<f32>(  // column-major
+    vec3(1.806574, -0.170089, -0.025206),
+    vec3(-0.695698, 1.305955, -0.154468),
+    vec3(-0.110879, -0.135865, 1.179674));
+const VIEW_EXPOSURE: f32 = 1.25;
+const VIEW_WHITE: f32 = 6.0;
+
+fn vlog_to_lin(v: vec3<f32>) -> vec3<f32> {
+    return select(pow(vec3(10.0), (v - 0.598206) / 0.241514) - 0.00873, (v - 0.125) / 5.6, v < vec3(0.181));
+}
+
+// Hue-preserving extended Reinhard shoulder, then sRGB. Mirrors photo::view_transform.
+fn view_transform(lin: vec3<f32>) -> vec3<f32> {
+    let c = max(lin, vec3(0.0)) * VIEW_EXPOSURE;
+    let m = max(c.r, max(c.g, c.b));
+    let k = select(0.0, (1.0 + m / (VIEW_WHITE * VIEW_WHITE)) / (1.0 + m), m > 0.0);
+    return lin_to_srgb(min(c * k, vec3(1.0)));
+}
+
+fn to_display(c: vec3<f32>) -> vec3<f32> {
+    if p.input == 1u { return view_transform(VGAMUT_TO_709 * vlog_to_lin(c)); }
+    return c;
 }
 
 // ---------------------------------------------------------- white balance
@@ -182,7 +211,7 @@ fn curve(i: u32, v: f32) -> f32 {
 }
 
 fn grade(input: vec3<f32>) -> vec3<f32> {
-    var c = srgb_to_lin(input);
+    var c = srgb_to_lin(to_display(input));
     c = white_balance(c);
     c *= exp2(p.exposure);
     c = tone(c);

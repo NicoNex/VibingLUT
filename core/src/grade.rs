@@ -34,11 +34,23 @@ pub struct Params {
     pub hue_shift: [f32; 8],
     pub hue_sat: [f32; 8],
     pub hue_lum: [f32; 8],
+    /// [`Profile`] of the input signal (the LUT's input domain).
+    pub input: u32,
     /// 0 = off, otherwise fraction of the width showing the ungraded image.
     pub split: f32,
     pub width: u32,
     pub height: u32,
     pub lut_size: u32,
+}
+
+/// Camera signal the LUT will be applied to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// Display-referred Rec.709 / sRGB (camera Standard, Vivid, … photo styles).
+    #[default]
+    Standard,
+    /// Panasonic V-Log / V-Gamut: the LUT maps V-Log to Rec.709.
+    VLog,
 }
 
 /// Control points of one curve, sorted by x, endpoints included.
@@ -123,8 +135,8 @@ mod tests {
 
     #[test]
     fn params_layout_matches_wgsl() {
-        // 12 scalars + 4×4 wheels + 3×8 hue + split,width,height,lut_size
-        assert_eq!(std::mem::size_of::<Params>(), (12 + 16 + 24 + 4) * 4);
+        // 12 scalars + 4×4 wheels + 3×8 hue + input,split,width,height,lut_size
+        assert_eq!(std::mem::size_of::<Params>(), (12 + 16 + 24 + 5) * 4);
     }
 
     #[test]

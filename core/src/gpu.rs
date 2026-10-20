@@ -362,4 +362,31 @@ mod tests {
         // ponytail: peak error comes from out-of-gamut clamping of strongly saturated darks.
         assert!(worst <= 8 && mean < 0.5, "65³ LUT vs direct grade: worst {worst}/255, mean {mean}");
     }
+
+    /// V-Log input: the GPU decode + view transform must reproduce what the
+    /// CPU renders for Standard, so both profiles start from the same look.
+    #[test]
+    fn vlog_input_matches_cpu_view_transform() {
+        use crate::grade::Profile;
+        use crate::photo::{view_transform, vlog_encode};
+        let Ok(gpu) = Gpu::new() else { return eprintln!("no GPU, skipped") };
+        let greys = [0.0f32, 0.02, 0.09, 0.18, 0.36, 0.9, 2.0];
+        let photo = Photo {
+            width: greys.len() as u32,
+            height: 1,
+            pixels: greys
+                .map(|g| {
+                    let v = vlog_encode(g);
+                    [v, v, v, 1.0]
+                })
+                .to_vec(),
+        };
+        let mut grade = Grade::default();
+        grade.params.input = Profile::VLog as u32;
+        let out = gpu.render(&gpu.upload(&photo), &grade, 0.0);
+        for (i, g) in greys.iter().enumerate() {
+            let want = (view_transform([*g; 3])[0] * 255.0).round() as i32;
+            assert!((out[i * 4] as i32 - want).abs() <= 1, "grey {g}: gpu {} cpu {want}", out[i * 4]);
+        }
+    }
 }
