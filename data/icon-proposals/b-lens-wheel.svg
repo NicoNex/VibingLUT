@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="sat" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5e5c64"/><stop offset="1" stop-color="#241f31"/></linearGradient>
+  </defs>
+  <circle cx="64" cy="68" r="54" fill="#000" opacity=".2"/>
+  <circle cx="64" cy="64" r="54" fill="url(#body)"/>
+  <circle cx="64" cy="64" r="46" fill="#1e1e1e"/>
+  <g transform="translate(64 64)">
+    <path d="M0 0 L38 0 A38 38 0 0 1 19 32.9 Z" fill="#e01b24"/>
+    <path d="M0 0 L19 32.9 A38 38 0 0 1 -19 32.9 Z" fill="#c061cb"/>
+    <path d="M0 0 L-19 32.9 A38 38 0 0 1 -38 0 Z" fill="#3584e4"/>
+    <path d="M0 0 L-38 0 A38 38 0 0 1 -19 -32.9 Z" fill="#33c7de"/>
+    <path d="M0 0 L-19 -32.9 A38 38 0 0 1 19 -32.9 Z" fill="#33d17a"/>
+    <path d="M0 0 L19 -32.9 A38 38 0 0 1 38 0 Z" fill="#f6d32d"/>
+    <circle r="38" fill="url(#sat)" opacity=".85"/>
+    <path d="M0 -12 L11 -6 V6 L0 12 L-11 6 V-6 Z" fill="#fff" opacity=".9"/>
+    <path d="M-11 -6 L0 0 L11 -6 M0 0 V12" stroke="#241f31" stroke-width="1.5" fill="none" opacity=".5"/>
+  </g>
+  <circle cx="64" cy="64" r="46" fill="none" stroke="#fff" stroke-opacity=".15" stroke-width="2"/>
+  <path d="M30 36 A42 42 0 0 1 64 20" stroke="#fff" stroke-opacity=".5" stroke-width="4" stroke-linecap="round" fill="none"/>
+</svg>
