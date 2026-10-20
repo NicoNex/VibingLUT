@@ -38,14 +38,32 @@ impl Photo {
         if RAW_EXTS.contains(&ext.as_str()) { load_raw(path) } else { load_raster(path) }
     }
 
-    /// Area-averaged copy that fits in `max` × `max`, keeping the aspect ratio.
+    /// Box-filtered copy that fits in `max` × `max`. Averages the stored
+    /// values directly, so linear RAW data is downscaled in linear light.
+    // ponytail: not image::imageops::thumbnail — it washes out f32 pixels.
     pub fn downscaled(&self, max: u32) -> Self {
-        let scale = max as f32 / self.width.max(self.height) as f32;
-        if scale >= 1.0 {
+        let f = self.width.max(self.height).div_ceil(max).max(1);
+        if f == 1 {
             return self.clone();
         }
-        let dim = |v: u32| ((v as f32 * scale).round() as u32).max(1);
-        Self::from_image(image::imageops::thumbnail(&self.to_image(), dim(self.width), dim(self.height)))
+        let (w, h) = ((self.width / f).max(1), (self.height / f).max(1));
+        let norm = 1.0 / (f * f) as f32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = [0.0f32; 4];
+                for dy in 0..f.min(self.height - y * f) {
+                    let row = ((y * f + dy) * self.width + x * f) as usize;
+                    for p in &self.pixels[row..row + f.min(self.width - x * f) as usize] {
+                        for c in 0..4 {
+                            acc[c] += p[c];
+                        }
+                    }
+                }
+                pixels.push(acc.map(|v| v * norm));
+            }
+        }
+        Self { width: w, height: h, pixels }
     }
 
     fn to_image(&self) -> Rgba32FImage {
