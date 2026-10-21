@@ -3,6 +3,7 @@
 #   make release / run-release  optimised build
 #   make install PREFIX=~/.local
 #   make arch                   build an Arch Linux package with makepkg
+#   make dmg                    build a macOS .dmg (run on macOS, needs dylibbundler)
 #   make pot                    refresh po/vibinglut.pot and merge it into po/*.po
 
 PREFIX  ?= /usr/local
@@ -17,7 +18,7 @@ ARCHDIR := packaging/arch
 LINGUAS := $(basename $(notdir $(wildcard po/*.po)))
 MOS     := $(foreach l,$(LINGUAS),target/locale/$(l)/LC_MESSAGES/$(BIN).mo)
 
-.PHONY: all build run release run-release test check fmt clean install uninstall arch pot locale
+.PHONY: all build run release run-release test check fmt clean install uninstall arch dmg pot locale
 
 all: release
 
@@ -79,6 +80,31 @@ arch:
 	sed -i 's/^pkgver=.*/pkgver=$(VERSION)/' $(ARCHDIR)/PKGBUILD
 	cd $(ARCHDIR) && makepkg -f
 	@echo "Install with: sudo pacman -U $(ARCHDIR)/$(BIN)-$(VERSION)-*.pkg.tar.zst"
+
+# ponytail: dylibbundler copies the linked dylibs only; GTK runtime data (pixbuf loaders,
+# Adwaita icon theme, schemas) still comes from Homebrew. Switch to gtk-mac-bundler if the
+# .app must run on Macs without Homebrew GTK.
+APP := target/VibingLUT.app
+dmg: release
+	rm -rf $(APP) target/$(BIN)-$(VERSION).dmg
+	install -d $(APP)/Contents/MacOS $(APP)/Contents/libs
+	install -m755 target/release/$(BIN) $(APP)/Contents/MacOS/$(BIN)
+	for l in $(LINGUAS); do install -d $(APP)/Contents/share/locale/$$l/LC_MESSAGES && \
+	  install -m644 target/locale/$$l/LC_MESSAGES/$(BIN).mo $(APP)/Contents/share/locale/$$l/LC_MESSAGES/; done
+	printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	  '<plist version="1.0"><dict>' \
+	  '<key>CFBundleName</key><string>VibingLUT</string>' \
+	  '<key>CFBundleIdentifier</key><string>$(APP_ID)</string>' \
+	  '<key>CFBundleExecutable</key><string>$(BIN)</string>' \
+	  '<key>CFBundleShortVersionString</key><string>$(VERSION)</string>' \
+	  '<key>CFBundlePackageType</key><string>APPL</string>' \
+	  '<key>NSHighResolutionCapable</key><true/>' \
+	  '</dict></plist>' > $(APP)/Contents/Info.plist
+	dylibbundler -of -b -x $(APP)/Contents/MacOS/$(BIN) -d $(APP)/Contents/libs -p @executable_path/../libs/
+	# dylibbundler's install_name_tool edits break signatures; arm64 refuses to run unsigned code.
+	codesign --force --deep -s - $(APP)
+	hdiutil create -volname VibingLUT -srcfolder $(APP) -ov -format UDZO target/$(BIN)-$(VERSION).dmg
 
 clean:
 	$(CARGO) clean
