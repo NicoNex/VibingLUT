@@ -4,10 +4,11 @@
 
 # VibingLUT
 
-### Turn any photo into a camera-ready 3D LUT.
+### The colorist's workbench for 3D LUTs.
 
-Grade a JPEG or a camera RAW, watch the result live on the GPU, and export a `.cube`
-you can load straight into your Lumix, your editor or your colour pipeline.
+Build looks on real images, compare entire LUT libraries side by side, combine LUTs,
+and convert them between log profiles, all on the GPU and with exact colour maths.
+Export to Resolve, Premiere, Final Cut, OBS, photo editors or straight to camera.
 Free, open source, native Linux desktop app.
 
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
@@ -24,21 +25,22 @@ Free, open source, native Linux desktop app.
 
 ## Why VibingLUT?
 
-You found the look. Now you want it **in camera**, on every shot, without opening a
-heavy video editor just to bake a LUT.
+Every colorist ends up with the same problems: dozens of LUTs nobody remembers, looks
+built for the wrong log curve, and a full NLE to open just to bake or audition one
+cube.
 
-VibingLUT is a **3D LUT creator built around photos**. Grade a picture with
-professional tools and get a mathematically exact LUT out of it, ready for in-camera
-preview, video editors or other photos. It also helps with the LUTs you already have:
-compare your whole collection side by side, and convert LUTs between camera log
-profiles. For example, a Fujifilm F-Log LUT becomes one for Panasonic V-Log or for a
-plain Standard picture profile.
+VibingLUT is a dedicated **LUT workbench**. Grade a still with professional tools and
+get a mathematically exact LUT out of it. Audition your whole collection on the same
+frame. Chain or mix LUTs, and retarget them between log profiles: a look built for
+ARRI LogC4 can run on Sony S-Log3, and a Fujifilm F-Log LUT can run on Panasonic
+V-Log or Rec.709. The results go to your grading suite, your editor or your camera.
 
-- **From photo to LUT in minutes.** Open a JPEG or RAW, grade it, press `Ctrl+E`.
+- **Look development on real images.** Open a frame grab, a JPEG or a camera RAW,
+  grade it, and press `Ctrl+E`.
 - **What you see is what you export.** The preview and the exported LUT come from the
   same GPU code, and the LUT is evaluated exactly at every lattice point.
-- **Made for cameras.** Lumix *Real Time LUT* sizes (33³ `.cube`, 17³ `.vlt`) are one
-  click away.
+- **Fits any pipeline.** 33³/65³/129³ `.cube`, Panasonic `.vlt` and HALD CLUT for
+  grading suites, editors, photo tools and on-set or in-camera monitoring.
 - **Native and fast.** Rust + GTK4/libadwaita, GPU-accelerated through Vulkan (Metal
   on macOS), no Electron and no browser engine.
 
@@ -251,7 +253,7 @@ Yes. VibingLUT is free software under the GPL-3.0.
 
 [GPL-3.0-or-later](LICENSE).
 
-<sub>Keywords: 3D LUT creator, cube LUT generator, create LUT from photo, Lumix Real
+<sub>Keywords: colorist tool, LUT manager, LUT editor, 3D LUT creator, cube LUT generator, create LUT from photo, Lumix Real
 Time LUT, V-Log to Rec.709, convert LUT between log profiles, Fujifilm F-Log LUT
 converter, HALD CLUT, VLT, color grading software for Linux, GTK4, libadwaita, Rust,
 Vulkan.</sub>
