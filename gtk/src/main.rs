@@ -84,7 +84,7 @@ enum Msg {
     /// A sidebar section switched off/on (`None` = the LUTs after the grade).
     Bypass(Option<Stage>, bool),
     /// Compare LUTs on the untouched photo instead of on top of the grade.
-    CompareOriginal(bool),
+    CompareGraded(bool),
     Preferences,
     Page(Page),
     LayerAdd(Layers, LabAdd),
@@ -103,6 +103,8 @@ enum Msg {
     Toast(String),
     /// Channel mixer: show output row / monochrome page, set a coefficient (delta from identity).
     MixerMono(bool),
+    /// Channel mixer may change brightness (Preserve luminance off).
+    MixerFree(bool),
     Mixer(usize, f64),
     /// Reference match: pick a file, it is decoded, then matched on the GPU.
     MatchChoose,
@@ -217,7 +219,8 @@ struct App {
     /// Sections switched off with their eye toggle; they are left out of preview and export.
     bypassed: Vec<Stage>,
     looks_off: bool,
-    compare_original: bool,
+    /// Compare LUTs on top of the Grade page's edits (off: on the untouched photo).
+    compare_graded: bool,
     /// What the Compare base was last built from: grade, looks (by identity), profile.
     base_key: Option<BaseKey>,
     /// Thumbnails need re-rendering (new source or library) next time Compare is shown.
@@ -460,6 +463,7 @@ impl App {
         sb.curves.set_all(&self.grade.curves);
         sb.hue_curves.set_all(&self.grade.curves);
         sb.mixer.mono.set_active(p.mixer_mono > 0.5);
+        sb.mixer.keep.set_active(p.mixer_free < 0.5);
         for (s, i, base) in &sb.mixer.sliders {
             s.adj.set_value(base + mixer_value(&p, *i) as f64);
         }
@@ -528,10 +532,10 @@ impl App {
     /// Hands the Grade page's result to Compare LUTs; true when it changed.
     fn sync_compare_base(&mut self) -> bool {
         let input = self.source_profile();
-        let (grade, looks) = if self.compare_original {
-            (self.grade.neutralized(), Vec::new())
-        } else {
+        let (grade, looks) = if self.compare_graded {
             (self.graded(), self.look_layers())
+        } else {
+            (self.grade.neutralized(), Vec::new())
         };
         let luts = looks
             .iter()
@@ -926,6 +930,7 @@ struct MixerUi {
     /// Output R, G, B rows, then the monochrome filter: (slider, `mixer_value` index, base).
     sliders: Vec<(Slider, usize, f64)>,
     mono: adw::SwitchRow,
+    keep: adw::SwitchRow,
 }
 
 /// Reference match: empty state, or the reference with its strength.
@@ -1015,17 +1020,27 @@ fn build_mixer(sender: &ComponentSender<App>) -> (gtk::Box, MixerUi) {
     });
 
     let mono = adw::SwitchRow::builder().title(gettext("Black & white")).use_markup(false).build();
+    let keep = adw::SwitchRow::builder()
+        .title(gettext("Preserve luminance"))
+        .subtitle(gettext("The mix changes colour, not brightness"))
+        .active(true)
+        .build();
     let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
     list.append(&mono);
+    list.append(&keep);
     let snd = sender.clone();
     mono.connect_active_notify(move |m| snd.input(Msg::MixerMono(m.is_active())));
+    let snd = sender.clone();
+    keep.connect_active_notify(move |k| snd.input(Msg::MixerFree(!k.is_active())));
 
     let bx = vbox(8);
     bx.append(&list);
     bx.append(&rows);
     bx.append(&pages);
-    bx.append(&caption(&gettext("Each output channel mixes the scene's red, green and blue. Greys stay grey.")));
-    (bx, MixerUi { rows, pages, sliders, mono })
+    bx.append(&caption(&gettext(
+        "Each output channel is a mix of the scene's red, green and blue; 100% of its own channel is no change.",
+    )));
+    (bx, MixerUi { rows, pages, sliders, mono, keep })
 }
 
 fn build_match(sender: &ComponentSender<App>) -> MatchUi {
@@ -1534,15 +1549,19 @@ impl SimpleComponent for App {
         let snd = sender.clone();
         reload.connect_clicked(move |_| snd.input(Msg::Reload));
         folder_row.append(&reload);
-        let original = gtk::ToggleButton::builder()
-            .icon_name("image-x-generic-symbolic")
-            .tooltip_text(gettext("Compare on the original photo, without the Grade edits"))
-            .css_classes(["flat"])
-            .build();
-        let snd = sender.clone();
-        original.connect_toggled(move |b| snd.input(Msg::CompareOriginal(b.is_active())));
-        folder_row.append(&original);
         folder_row.append(&folder_btn);
+        // What the candidates are applied to: the untouched photo, or the Grade page's result.
+        let base_sel =
+            toggles(&[("original", gettext("Original").as_str()), ("graded", gettext("With grade").as_str())]);
+        base_sel.set_active_name(Some("original"));
+        base_sel.set_tooltip_text(Some(&gettext("Apply the LUTs to the untouched photo or to it as edited in Grade")));
+        base_sel.set_margin_start(8);
+        base_sel.set_margin_end(8);
+        base_sel.set_margin_bottom(6);
+        let snd = sender.clone();
+        base_sel.connect_active_name_notify(move |g| {
+            snd.input(Msg::CompareGraded(g.active_name().as_deref() == Some("graded")))
+        });
         let groups = gtk::DropDown::builder().visible(false).margin_start(8).margin_end(8).margin_bottom(4).build();
         groups.update_property(&[gtk::accessible::Property::Label(&gettext("Subfolder"))]);
         let snd = sender.clone();
@@ -1576,6 +1595,7 @@ impl SimpleComponent for App {
         let gallery = vbox(0);
         gallery.add_css_class("sidebar-pane");
         gallery.append(&folder_row);
+        gallery.append(&base_sel);
         gallery.append(&groups);
         gallery.append(&search);
         gallery.append(&gallery_stack);
@@ -1885,7 +1905,7 @@ impl SimpleComponent for App {
             looks: Vec::new(),
             bypassed: Vec::new(),
             looks_off: false,
-            compare_original: false,
+            compare_graded: false,
             base_key: None,
             gallery_stale: true,
             lab_input: Profile::Standard,
@@ -2123,6 +2143,10 @@ impl SimpleComponent for App {
                 m.rows.set_sensitive(!on);
                 let page = m.rows.active_name().map(|n| n.to_string()).unwrap_or_else(|| "0".into());
                 m.pages.set_visible_child_name(if on { "mono" } else { &page });
+                self.render();
+            }
+            Msg::MixerFree(free) => {
+                self.grade.params.mixer_free = if free { 1.0 } else { 0.0 };
                 self.render();
             }
             Msg::Mixer(i, delta) => {
@@ -2432,8 +2456,8 @@ impl SimpleComponent for App {
                 self.looks_off = off;
                 self.layers_changed(Layers::Look, false, &sender);
             }
-            Msg::CompareOriginal(on) => {
-                self.compare_original = on;
+            Msg::CompareGraded(on) => {
+                self.compare_graded = on;
                 self.refresh();
             }
             Msg::Reload => match settings::folder(settings::LUT_FOLDER) {

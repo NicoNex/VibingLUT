@@ -8,7 +8,8 @@ struct Params {
     saturation: f32, vibrance: f32, sat_shadows: f32, sat_highlights: f32,
     lift: array<f32, 4>, gamma: array<f32, 4>, gain: array<f32, 4>, offset: array<f32, 4>,
     hue_shift: array<f32, 8>, hue_sat: array<f32, 8>, hue_lum: array<f32, 8>,
-    mixer: array<f32, 9>, mixer_mono: f32, mono_mix: array<f32, 3>, film_sat: f32, film_density: f32,
+    mixer: array<f32, 9>, mixer_mono: f32, mono_mix: array<f32, 3>, mixer_free: f32,
+    film_sat: f32, film_density: f32,
     match_amount: f32, match_ab: array<f32, 6>,
     input: u32, gamut: array<f32, 9>, split: f32, width: u32, height: u32, lut_size: u32, overlay: u32,
 }
@@ -177,29 +178,27 @@ fn tone(c: vec3<f32>) -> vec3<f32> {
 }
 
 // ----------------------------------------------------------- channel mixer
-// Scene-linear, so it behaves like a filter in front of the sensor. Each row
-// is normalised to sum 1: neutrals stay neutral whatever the mix.
-
-fn mix_row(r: vec3<f32>, c: vec3<f32>) -> f32 {
-    let sum = r.x + r.y + r.z;
-    return dot(select(r, r / sum, abs(sum) > 0.05), c);
-}
+// Scene-linear, so it behaves like a filter in front of the sensor. The
+// matrix applies as set (100% = the channel itself). Preserving luminance
+// adds back the luminance the mix took away: additive, so it can never
+// divide by a small number, and continuous in every coefficient.
 
 fn mixer(c: vec3<f32>) -> vec3<f32> {
     let m = p.mixer;
-    let row0 = vec3(m[0], m[1], m[2]) * 0.01;
+    let keep = p.mixer_free < 0.5;
     if p.mixer_mono > 0.5 {
-        // Black & white: luminance weights plus a colour filter.
-        let f = vec3(p.mono_mix[0], p.mono_mix[1], p.mono_mix[2]) * 0.01;
-        return vec3(max(mix_row(LUMA + f, c), 0.0));
+        // Black & white: luminance weights plus a colour filter. Keeping
+        // brightness means weights that sum to 1 (floored, so a filter that
+        // cancels out dims instead of exploding).
+        let w = LUMA + vec3(p.mono_mix[0], p.mono_mix[1], p.mono_mix[2]) * 0.01;
+        let total = select(1.0, max(w.x + w.y + w.z, 0.25), keep);
+        return vec3(max(dot(w, c) / total, 0.0));
     }
-    if all(row0 == vec3(0.0)) && m[3] == 0.0 && m[4] == 0.0 && m[5] == 0.0 && m[6] == 0.0 && m[7] == 0.0 && m[8] == 0.0 {
-        return c;
-    }
-    return vec3(
-        mix_row(vec3(1.0, 0.0, 0.0) + row0, c),
-        mix_row(vec3(0.0, 1.0, 0.0) + vec3(m[3], m[4], m[5]) * 0.01, c),
-        mix_row(vec3(0.0, 0.0, 1.0) + vec3(m[6], m[7], m[8]) * 0.01, c));
+    let out = vec3(
+        dot(vec3(1.0 + m[0] * 0.01, m[1] * 0.01, m[2] * 0.01), c),
+        dot(vec3(m[3] * 0.01, 1.0 + m[4] * 0.01, m[5] * 0.01), c),
+        dot(vec3(m[6] * 0.01, m[7] * 0.01, 1.0 + m[8] * 0.01), c));
+    return select(out, out + vec3(dot(c - out, LUMA)), keep);
 }
 
 // ------------------------------------------------------------------ OKLab

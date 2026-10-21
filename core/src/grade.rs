@@ -63,6 +63,8 @@ pub struct Params {
     /// 1 = monochrome, weighted by luminance plus `mono_mix` (percent per input channel).
     pub mixer_mono: f32,
     pub mono_mix: [f32; 3],
+    /// 1 = the mix may change brightness; 0 (default) keeps each pixel's luminance.
+    pub mixer_free: f32,
     /// Film colour: saturation in dye-density space (−100..100) and density
     /// of saturated colours (0..100).
     pub film_sat: f32,
@@ -197,7 +199,9 @@ impl Grade {
             Stage::Wheels => (p.lift, p.gamma, p.gain, p.offset) = (d.lift, d.gamma, d.gain, d.offset),
             Stage::Selective => (p.hue_shift, p.hue_sat, p.hue_lum) = (d.hue_shift, d.hue_sat, d.hue_lum),
             Stage::Curves => (0..HUE_HUE).for_each(|c| curves[c] = neutral_curve(c)),
-            Stage::Mixer => (p.mixer, p.mixer_mono, p.mono_mix) = (d.mixer, d.mixer_mono, d.mono_mix),
+            Stage::Mixer => {
+                (p.mixer, p.mixer_mono, p.mono_mix, p.mixer_free) = (d.mixer, d.mixer_mono, d.mono_mix, d.mixer_free)
+            }
             Stage::Film => (p.film_sat, p.film_density) = (d.film_sat, d.film_density),
             Stage::HueCurves => (HUE_HUE..=LUM_SAT).for_each(|c| curves[c] = neutral_curve(c)),
             Stage::Match => {
@@ -305,9 +309,9 @@ mod tests {
 
     #[test]
     fn params_layout_matches_wgsl() {
-        // 12 scalars + 4×4 wheels + 3×8 hue + mixer 9+1+3 + film 2 + match 1+6
+        // 12 scalars + 4×4 wheels + 3×8 hue + mixer 9+1+3+1 + film 2 + match 1+6
         // + input + 3×3 gamut + split,width,height,lut_size,overlay
-        assert_eq!(std::mem::size_of::<Params>(), (12 + 16 + 24 + 13 + 2 + 7 + 1 + 9 + 5) * 4);
+        assert_eq!(std::mem::size_of::<Params>(), (12 + 16 + 24 + 14 + 2 + 7 + 1 + 9 + 5) * 4);
     }
 
     #[test]

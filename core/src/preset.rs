@@ -110,8 +110,9 @@ impl Preset {
             (p.saturation, p.vibrance, p.sat_shadows, p.sat_highlights);
         (params.lift, params.gamma, params.gain, params.offset) = (p.lift, p.gamma, p.gain, p.offset);
         (params.hue_shift, params.hue_sat, params.hue_lum) = (p.hue_shift, p.hue_sat, p.hue_lum);
-        (params.mixer, params.mixer_mono, params.mono_mix) =
-            (p.mixer, if p.mixer_mono > 0.5 { 1.0 } else { 0.0 }, p.mono_mix);
+        (params.mixer, params.mono_mix) = (p.mixer, p.mono_mix);
+        params.mixer_mono = if p.mixer_mono > 0.5 { 1.0 } else { 0.0 };
+        params.mixer_free = if p.mixer_free > 0.5 { 1.0 } else { 0.0 };
         (params.film_sat, params.film_density) = (p.film_sat, p.film_density);
         (params.match_amount, params.match_ab) = (p.match_amount, p.match_ab);
         Ok(Self { name: file.name, grade: Grade { params, curves } })

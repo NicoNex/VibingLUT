@@ -654,6 +654,21 @@ mod tests {
                 assert!(luma(&out, i) < luma(&plain, i) - 2.0, "{k} did not darken colour {i}");
             }
         }
+        // Mixer: every coefficient acts (including a row's own channel),
+        // luminance is kept by default, and no setting blows up.
+        // Luminance is kept in linear light, where the mixer works.
+        let lum = |o: &[u8], i: usize| {
+            let lin = |k: usize| crate::photo::srgb_invert_gamma(o[i * 4 + k] as f32 / 255.0);
+            (0.2126 * lin(0) + 0.7152 * lin(1) + 0.0722 * lin(2)) * 255.0
+        };
+        for (i, v) in [(0, 50.0), (0, -50.0), (1, 50.0), (1, -95.0), (1, -100.0), (1, -105.0)] {
+            let mut g = Grade::default();
+            g.params.mixer[i] = v;
+            let out = render(&g);
+            assert_ne!(&out[4..7], &plain[4..7], "mixer[{i}] = {v} did nothing");
+            assert!((lum(&out, 1) - lum(&plain, 1)).abs() < 4.0, "mixer[{i}] = {v} changed luminance");
+            assert!(out[4..7].iter().all(|&c| c < 255), "mixer[{i}] = {v} blew up: {:?}", &out[4..7]);
+        }
         let mut g = Grade::default();
         g.params.mixer_mono = 1.0;
         let out = render(&g);
