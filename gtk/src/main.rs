@@ -1104,7 +1104,7 @@ impl SimpleComponent for App {
             .label(gettext("Export LUT"))
             .menu_model(&export_menu)
             .css_classes(["suggested-action"])
-            .tooltip_text(gettext("Export 33³ .cube for Lumix (Ctrl+E)"))
+            .tooltip_text(gettext("Export a 33³ .cube (Ctrl+E)"))
             .sensitive(false)
             .build();
         let snd = sender.clone();
@@ -1806,15 +1806,16 @@ fn export_menu(action: &str, with_identity: bool) -> gio::Menu {
     let item =
         |m: &gio::Menu, label: &str, target: &str| m.append(Some(label), Some(&format!("win.{action}::{target}")));
     let menu = gio::Menu::new();
-    let camera = gio::Menu::new();
-    item(&camera, "Lumix · 33³ .cube", "cube-33");
-    item(&camera, "Lumix / VariCam · 17³ .vlt", "vlt-17");
-    menu.append_section(Some(gettext("Camera").as_str()), &camera);
-    let post = gio::Menu::new();
-    item(&post, &gettext("Post-production · 65³ .cube"), "cube-65");
-    item(&post, &gettext("High precision · 129³ .cube"), "cube-129");
-    item(&post, "HALD CLUT · 64³ .png", "hald-64");
-    menu.append_section(Some(gettext("Post-production").as_str()), &post);
+    // .cube is the universal 3D LUT format; the sizes differ only in precision.
+    let cube = gio::Menu::new();
+    item(&cube, &gettext("33³ .cube · cameras and monitors"), "cube-33");
+    item(&cube, &gettext("65³ .cube · grading and editing"), "cube-65");
+    item(&cube, &gettext("129³ .cube · maximum precision"), "cube-129");
+    menu.append_section(Some(".cube"), &cube);
+    let other = gio::Menu::new();
+    item(&other, &gettext("Panasonic VLT · 17³ .vlt"), "vlt-17");
+    item(&other, &gettext("HALD CLUT · 64³ .png"), "hald-64");
+    menu.append_section(Some(gettext("Other formats").as_str()), &other);
     if with_identity {
         let tools = gio::Menu::new();
         item(&tools, &gettext("HALD identity · .png"), "identity-64");

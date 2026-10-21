@@ -101,12 +101,15 @@ tones that shift become obvious instantly, in every view.
 
 ### 📤 Export
 
+`.cube` is the universal 3D LUT format, read by almost every grading suite, editor,
+monitor and camera that loads LUTs. Pick the size your target supports:
+
 | Target | Format | Size |
 |---|---|---|
-| Lumix in-camera *Real Time LUT* | `.cube` | 33³ |
-| Lumix / VariCam | Panasonic `.vlt` | 17³ |
-| Post-production (Resolve, Premiere, FCP, OBS…) | `.cube` | 65³ |
-| High precision | `.cube` | 129³ |
+| Cameras, monitors, recorders, OBS | `.cube` | 33³ |
+| Grading and editing (Resolve, Premiere, Final Cut, Nuke…) | `.cube` | 65³ |
+| Maximum precision | `.cube` | 129³ |
+| Panasonic VariCam / Lumix (native format) | `.vlt` | 17³ |
 | Photo editors, GIMP, ImageMagick, ffmpeg `haldclut` | HALD CLUT `.png` (16-bit) | 64³ |
 | Identity HALD for external tools | HALD `.png` | 64³ |
 
@@ -145,8 +148,8 @@ exactly, with no second decode.
    profile you shoot in.
 3. **Grade:** use the wheels, curves and selective colour, stack existing LUTs, and
    check the scopes and the test chart.
-4. **Export:** `Ctrl+E` writes a 33³ `.cube` for your camera. Use the export menu for
-   VLT, HALD or larger sizes.
+4. **Export:** `Ctrl+E` writes a 33³ `.cube`, which works almost everywhere. Use the
+   export menu for 65³ or 129³ `.cube`, VLT or HALD.
 
 ### Using it with a Lumix (S9, S5 II, GH7…)
 

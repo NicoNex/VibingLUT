@@ -215,7 +215,7 @@ pub fn build(sender: &ComponentSender<App>, export_menu: &gio::Menu) -> LabUi {
     // 3 · Export
     panel.append(&heading(&gettext("3 · Export")));
     let row = gtk::Box::builder().spacing(6).homogeneous(true).build();
-    for (label, size) in [("Lumix · 33³ .cube", 33), ("Post · 65³ .cube", 65)] {
+    for (label, size) in [("33³ .cube", 33), ("65³ .cube", 65)] {
         let b = gtk::Button::builder().label(label).css_classes(["suggested-action"]).build();
         let snd = sender.clone();
         b.connect_clicked(move |_| snd.input(Msg::Export(vibinglut_core::lut::Format::Cube, size, crate::What::Lab)));
