@@ -46,6 +46,11 @@ pub fn is_raw(path: &Path) -> bool {
     path.extension().is_some_and(|e| RAW_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
 }
 
+/// A file VibingLUT opens as a photo (raster or camera RAW).
+pub fn is_photo(path: &Path) -> bool {
+    is_raw(path) || path.extension().is_some_and(|e| RASTER_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
 /// A decoded file, before it is expressed as a camera signal.
 #[derive(Clone, Debug)]
 pub enum Decoded {
@@ -61,6 +66,14 @@ impl Decoded {
             load_raw(path).map(|p| Decoded::Raw(Arc::new(p)))
         } else {
             load_raster(path).map(|p| Decoded::Raster(Arc::new(p)))
+        }
+    }
+
+    /// Box-filtered copy that fits in `max` × `max` (filmstrip photos).
+    pub fn downscaled(&self, max: u32) -> Self {
+        match self {
+            Decoded::Raster(p) => Decoded::Raster(Arc::new(p.downscaled(max))),
+            Decoded::Raw(p) => Decoded::Raw(Arc::new(p.downscaled(max))),
         }
     }
 

@@ -8,7 +8,10 @@ use gettextrs::gettext;
 use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::gtk::{cairo, gdk};
-use vibinglut_core::grade::{Curve, identity_curve, sample_curve};
+use vibinglut_core::grade::{
+    CURVES, Curve, HUE_HUE, LUM_SAT, is_periodic, neutral_curve, sample_curve, sample_periodic,
+};
+use vibinglut_core::lab::oklch_to_srgb;
 
 // ------------------------------------------------------------------ slider
 
@@ -18,7 +21,6 @@ pub struct Slider {
     pub root: gtk::Box,
     pub scale: gtk::Scale,
     pub adj: gtk::Adjustment,
-    pub default: f64,
 }
 
 impl Slider {
@@ -109,30 +111,37 @@ impl Slider {
         });
         scale.add_controller(scroll);
 
-        Self { root, scale, adj, default }
+        Self { root, scale, adj }
     }
 
     pub fn connect(&self, f: impl Fn(f64) + 'static) {
         self.adj.connect_value_changed(move |a| f(a.value()));
     }
-
-    pub fn reset(&self) {
-        self.adj.set_value(self.default);
-    }
 }
 
 // ------------------------------------------------------------ curve editor
 
+/// Master, R, G, B; the hue and lightness curves draw in the master colour.
 const CHANNEL_RGB: [(f64, f64, f64); 4] =
     [(0.92, 0.92, 0.92), (0.94, 0.33, 0.31), (0.36, 0.82, 0.42), (0.36, 0.56, 0.98)];
+/// Height of the colour strip under the hue and lightness curves.
+const STRIP: f64 = 10.0;
 const HIT_RADIUS: f64 = 12.0;
 const PAD: f64 = 8.0;
 const MIN_GAP: f64 = 0.01;
 
+/// The curves of one editor: channels `first..first + curves.len()` of the grade.
 struct CurveState {
-    curves: [Curve; 4],
+    curves: Vec<Curve>,
+    first: usize,
     active: usize,
     drag: Option<(usize, f64, f64)>, // point index, start x, start y (curve space)
+}
+
+impl CurveState {
+    fn active_mut(&mut self) -> &mut Curve {
+        &mut self.curves[self.active - self.first]
+    }
 }
 
 #[derive(Clone)]
@@ -161,10 +170,13 @@ fn hit(area: &gtk::DrawingArea, pts: &[(f32, f32)], range: std::ops::Range<usize
 }
 
 impl CurveEditor {
-    pub fn new(on_change: impl Fn(usize, Curve) + 'static) -> Self {
+    /// Editor for the grade's curve channels `channels`; `on_change` gets the
+    /// grade channel and its new points.
+    pub fn new(channels: std::ops::Range<usize>, on_change: impl Fn(usize, Curve) + 'static) -> Self {
         let state = Rc::new(RefCell::new(CurveState {
-            curves: std::array::from_fn(|_| identity_curve()),
-            active: 0,
+            curves: channels.clone().map(neutral_curve).collect(),
+            first: channels.start,
+            active: channels.start,
             drag: None,
         }));
         let area = gtk::DrawingArea::builder().content_height(260).hexpand(true).css_classes(["curve-area"]).build();
@@ -181,7 +193,7 @@ impl CurveEditor {
                 let inserted = {
                     let mut st = s.borrow_mut();
                     let ch = st.active;
-                    let pts = &mut st.curves[ch];
+                    let pts = st.active_mut();
                     let (idx, inserted) = match hit(&a, pts, 0..pts.len(), x, y) {
                         Some(i) => (i, None),
                         None => {
@@ -213,7 +225,7 @@ impl CurveEditor {
                     let Some((i, x0, y0)) = st.drag else { return };
                     let (w, h) = inner(&a);
                     let ch = st.active;
-                    let pts = &mut st.curves[ch];
+                    let pts = st.active_mut();
                     let last = pts.len() - 1;
                     // Endpoints slide vertically only; inner points stay between neighbours.
                     let x = if i == 0 || i == last {
@@ -223,6 +235,11 @@ impl CurveEditor {
                         if lo < hi { (x0 + dx / w).clamp(lo, hi) } else { (lo + hi) / 2.0 }
                     };
                     pts[i] = (x as f32, (y0 - dy / h).clamp(0.0, 1.0) as f32);
+                    // Hue curves wrap: both ends are red, so they move together.
+                    if is_periodic(ch) && (i == 0 || i == last) {
+                        let y = pts[i].1;
+                        (pts[0].1, pts[last].1) = (y, y);
+                    }
                     (ch, pts.clone())
                 };
                 a.queue_draw();
@@ -246,11 +263,12 @@ impl CurveEditor {
                 let (ch, curve) = {
                     let mut st = s.borrow_mut();
                     let ch = st.active;
-                    let pts = &mut st.curves[ch];
+                    let pts = st.active_mut();
                     let Some(i) = hit(&a, pts, 1..pts.len() - 1, x, y) else { return };
                     pts.remove(i);
+                    let curve = pts.clone();
                     st.drag = None;
-                    (ch, st.curves[ch].clone())
+                    (ch, curve)
                 };
                 a.queue_draw();
                 f(ch, curve);
@@ -266,17 +284,24 @@ impl CurveEditor {
         self.area.queue_draw();
     }
 
-    /// Resets the active channel and returns its new (identity) curve.
+    /// Resets the active channel and returns its new (neutral) curve.
     pub fn reset_active(&self) -> (usize, Curve) {
         let mut st = self.state.borrow_mut();
         let ch = st.active;
-        st.curves[ch] = identity_curve();
+        let curve = neutral_curve(ch);
+        *st.active_mut() = curve.clone();
         self.area.queue_draw();
-        (ch, st.curves[ch].clone())
+        (ch, curve)
     }
 
-    pub fn reset_all(&self) {
-        self.state.borrow_mut().curves = std::array::from_fn(|_| identity_curve());
+    /// Shows this editor's channels of `curves` (e.g. after loading a preset).
+    pub fn set_all(&self, curves: &[Curve; CURVES]) {
+        let mut st = self.state.borrow_mut();
+        let first = st.first;
+        for (k, c) in st.curves.iter_mut().enumerate() {
+            *c = curves[first + k].clone();
+        }
+        st.drag = None;
         self.area.queue_draw();
     }
 }
@@ -284,6 +309,18 @@ impl CurveEditor {
 fn draw_curves(area: &gtk::DrawingArea, cr: &cairo::Context, w: f64, h: f64, st: &CurveState) {
     let fg = area.color();
     let (iw, ih) = (w - 2.0 * PAD, h - 2.0 * PAD);
+    // What the x axis means: hue for the hue curves, lightness for Lum vs Sat.
+    if st.active >= HUE_HUE {
+        const STEPS: usize = 72;
+        for i in 0..STEPS {
+            let t = (i as f64 + 0.5) / STEPS as f64;
+            let [r, g, b] =
+                if st.active == LUM_SAT { [t as f32; 3] } else { oklch_to_srgb(0.72, 0.13, t as f32 * TAU as f32) };
+            cr.set_source_rgb(r as f64, g as f64, b as f64);
+            cr.rectangle(PAD + i as f64 / STEPS as f64 * iw, PAD + ih - STRIP, iw / STEPS as f64 + 0.5, STRIP);
+            let _ = cr.fill();
+        }
+    }
     cr.set_line_width(1.0);
     cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.10);
     for i in 1..4 {
@@ -293,21 +330,29 @@ fn draw_curves(area: &gtk::DrawingArea, cr: &cairo::Context, w: f64, h: f64, st:
         cr.move_to(PAD, PAD + t * ih);
         cr.line_to(PAD + iw, PAD + t * ih);
     }
-    cr.move_to(PAD, PAD + ih);
-    cr.line_to(PAD + iw, PAD);
+    // The neutral curve: the diagonal, or the no-change line at 0.5.
+    let neutral = neutral_curve(st.active);
+    cr.move_to(PAD, PAD + (1.0 - neutral[0].1 as f64) * ih);
+    cr.line_to(PAD + iw, PAD + (1.0 - neutral[1].1 as f64) * ih);
     let _ = cr.stroke();
 
     let mut samples = vec![0.0f32; 256];
     // Inactive channels faintly behind, the active one on top.
-    let order = (0..4).filter(|&c| c != st.active).chain(std::iter::once(st.active));
+    let channels = st.first..st.first + st.curves.len();
+    let order = channels.filter(|&c| c != st.active).chain(std::iter::once(st.active));
     for ch in order {
-        let pts = &st.curves[ch];
+        let pts = &st.curves[ch - st.first];
         let active = ch == st.active;
-        if !active && pts == &identity_curve() {
+        // Hue and lightness curves share no axis: only the active one is drawn.
+        if !active && (pts == &neutral_curve(ch) || ch >= HUE_HUE) {
             continue;
         }
-        sample_curve(pts, &mut samples);
-        let (r, g, b) = CHANNEL_RGB[ch];
+        if is_periodic(ch) {
+            sample_periodic(pts, &mut samples)
+        } else {
+            sample_curve(pts, &mut samples)
+        }
+        let (r, g, b) = CHANNEL_RGB[if ch < HUE_HUE { ch } else { 0 }];
         cr.set_source_rgba(r, g, b, if active { 1.0 } else { 0.35 });
         cr.set_line_width(if active { 2.0 } else { 1.25 });
         for (i, v) in samples.iter().enumerate() {
@@ -439,4 +484,29 @@ fn draw_wheel(cr: &cairo::Context, w: f64, h: f64, (px, py): (f64, f64)) {
     cr.set_source_rgba(0.0, 0.0, 0.0, 0.7);
     cr.set_line_width(1.5);
     let _ = cr.stroke();
+}
+
+// ------------------------------------------------------- vectorscope overlay
+
+/// Angle of the skin tone line ("I-line") on a Cb/Cr vectorscope: 123° from
+/// the +Cb axis, between red and yellow. Skin of any ethnicity lands on it.
+const SKIN_LINE_DEG: f64 = 123.0;
+
+/// Transparent layer for the vectorscope (a square `Contain` picture) that
+/// draws the skin tone line.
+pub fn skin_line() -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder().can_target(false).build();
+    area.set_draw_func(|_, cr, w, h| {
+        let (w, h) = (w as f64, h as f64);
+        let half = w.min(h) / 2.0;
+        let (cx, cy) = (w / 2.0, h / 2.0);
+        let a = SKIN_LINE_DEG.to_radians();
+        cr.set_line_width(1.5);
+        cr.set_dash(&[4.0, 3.0], 0.0);
+        cr.set_source_rgba(1.0, 0.82, 0.62, 0.9);
+        cr.move_to(cx, cy);
+        cr.line_to(cx + a.cos() * half, cy - a.sin() * half);
+        let _ = cr.stroke();
+    });
+    area
 }

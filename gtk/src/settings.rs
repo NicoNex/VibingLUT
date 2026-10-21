@@ -24,3 +24,8 @@ pub fn set_folder(key: &str, dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(f.parent().expect("config file has a parent"))?;
     std::fs::write(f, dir.to_string_lossy().as_bytes())
 }
+
+/// Where presets are saved (`vibinglut_core::preset` JSON files).
+pub fn presets_dir() -> PathBuf {
+    file("presets")
+}

@@ -260,9 +260,12 @@ pub enum Job {
     SetRoll(u64, Vec<Arc<Photo>>),
     /// Every filmstrip photo through the grade and the look LUTs.
     RenderRoll(Grade),
-    /// Colour transfer from the current photo (decoded by `input`, otherwise
-    /// ungraded) to a display-referred reference.
+    /// Colour transfer from `source` (decoded by `input`, otherwise ungraded)
+    /// to a display-referred reference; `generation` lets the UI drop
+    /// results it no longer wants. A small copy of the photo is plenty.
     Match {
+        generation: u64,
+        source: Arc<Photo>,
         reference: Arc<Photo>,
         input: Grade,
     },
@@ -354,9 +357,16 @@ pub enum Done {
         height: u32,
         rgba: Vec<u8>,
     },
-    Matched(Match),
+    Matched(u64, Match),
     /// A compared LUT file could not be read (deleted or broken since the scan).
     Unreadable(PathBuf, String),
+}
+
+/// A filmstrip photo on the GPU and the grade its frame was last rendered with.
+struct RollFrame {
+    photo: Arc<Photo>,
+    gpu: GpuPhoto,
+    last: Option<Grade>,
 }
 
 #[derive(Default)]
@@ -375,8 +385,10 @@ struct Worker {
     // ponytail: each pass re-reads the files (no lattice cache, keeps memory flat
     // for big libraries); cache by path + mtime if passes get slow.
     gallery: Option<(u64, Arc<Vec<PathBuf>>, usize)>,
-    /// Filmstrip photos on the GPU, with their generation.
-    roll: (u64, Vec<GpuPhoto>),
+    /// Filmstrip photos on the GPU, with their generation; kept by identity
+    /// so a new strip only uploads the photos it did not have. Each keeps
+    /// the grade it was last rendered with, so only stale frames re-render.
+    roll: (u64, Vec<RollFrame>),
     /// Last grade baked for the Lab, reused until the grade changes.
     grade_lut: std::cell::RefCell<Option<(Grade, Arc<Lut3d>)>>,
 }
@@ -431,6 +443,8 @@ impl Worker {
                     let stack = Stack { input: Profile::Standard, layers, blend: Blend::Chain };
                     gpu.upload_lut(&lab::compose(&stack, 33, &|g| self.bake_cached(gpu, g)))
                 });
+                // The filmstrip shows the looks too: every frame is stale.
+                self.roll.1.iter_mut().for_each(|f| f.last = None);
             }
             Job::SetCompareBase(base) => {
                 self.base = base.map(|b| {
@@ -446,21 +460,37 @@ impl Worker {
                 notify(Done::Graded { width: ph.width, height: ph.height, rgba, scopes });
             }
             Job::SetRoll(generation, photos) => {
-                self.roll = (generation, photos.iter().map(|p| gpu.upload(p)).collect())
+                let (old_gen, mut old) = std::mem::take(&mut self.roll);
+                let roll = photos
+                    .into_iter()
+                    .map(|photo| match old.iter().position(|f| Arc::ptr_eq(&f.photo, &photo)) {
+                        // A new generation means new indices: its frames must all be sent again.
+                        Some(i) => {
+                            let f = old.swap_remove(i);
+                            RollFrame { last: f.last.filter(|_| generation == old_gen), ..f }
+                        }
+                        None => RollFrame { gpu: gpu.upload(&photo), photo, last: None },
+                    })
+                    .collect();
+                self.roll = (generation, roll);
             }
             Job::RenderRoll(grade) => {
                 let generation = self.roll.0;
-                for (index, ph) in self.roll.1.iter().enumerate() {
-                    let rgba = gpu.render(ph, &grade, self.look.as_ref(), 0.0);
-                    notify(Done::RollFrame { generation, index, width: ph.width, height: ph.height, rgba });
+                for (index, f) in self.roll.1.iter_mut().enumerate() {
+                    if f.last.as_ref() != Some(&grade) {
+                        let (ph, look) = (&f.gpu, self.look.as_ref());
+                        let rgba = gpu.render(ph, &grade, look, 0.0);
+                        notify(Done::RollFrame { generation, index, width: ph.width, height: ph.height, rgba });
+                        f.last = Some(grade.clone());
+                    }
                 }
             }
-            Job::Match { reference, input } => {
-                let Some(ph) = &self.photo else { return };
+            Job::Match { generation, source, reference, input } => {
                 // ponytail: 8-bit display render as the source sample, plenty for statistics.
-                let source = matching::samples_rgba8(&gpu.render(ph, &input, None, 0.0), MATCH_SAMPLES);
+                let source =
+                    matching::samples_rgba8(&gpu.render(&gpu.upload(&source), &input, None, 0.0), MATCH_SAMPLES);
                 let reference = matching::samples_rgba_f32(&reference.pixels, MATCH_SAMPLES);
-                notify(Done::Matched(matching::transfer(&source, &reference)));
+                notify(Done::Matched(generation, matching::transfer(&source, &reference)));
             }
             Job::ApplyLut(path, split) => {
                 let Some(ph) = &self.photo else { return };

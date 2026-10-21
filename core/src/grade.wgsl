@@ -8,7 +8,7 @@ struct Params {
     saturation: f32, vibrance: f32, sat_shadows: f32, sat_highlights: f32,
     lift: array<f32, 4>, gamma: array<f32, 4>, gain: array<f32, 4>, offset: array<f32, 4>,
     hue_shift: array<f32, 8>, hue_sat: array<f32, 8>, hue_lum: array<f32, 8>,
-    mixer: array<f32, 9>, mixer_mono: f32, film_sat: f32, film_density: f32,
+    mixer: array<f32, 9>, mixer_mono: f32, mono_mix: array<f32, 3>, film_sat: f32, film_density: f32,
     match_amount: f32, match_ab: array<f32, 6>,
     input: u32, gamut: array<f32, 9>, split: f32, width: u32, height: u32, lut_size: u32, overlay: u32,
 }
@@ -189,8 +189,9 @@ fn mixer(c: vec3<f32>) -> vec3<f32> {
     let m = p.mixer;
     let row0 = vec3(m[0], m[1], m[2]) * 0.01;
     if p.mixer_mono > 0.5 {
-        // Black & white: luminance weights plus the red row as a colour filter.
-        return vec3(max(mix_row(LUMA + row0, c), 0.0));
+        // Black & white: luminance weights plus a colour filter.
+        let f = vec3(p.mono_mix[0], p.mono_mix[1], p.mono_mix[2]) * 0.01;
+        return vec3(max(mix_row(LUMA + f, c), 0.0));
     }
     if all(row0 == vec3(0.0)) && m[3] == 0.0 && m[4] == 0.0 && m[5] == 0.0 && m[6] == 0.0 && m[7] == 0.0 && m[8] == 0.0 {
         return c;

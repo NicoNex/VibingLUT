@@ -15,6 +15,9 @@ pub const BAND_HUES: [f32; 8] = [0.506, 0.960, 1.920, 2.478, 3.403, 4.608, 5.236
 /// Hue shift at ±100 on a band, in radians (`band(p.hue_shift) * 0.005`).
 pub const BAND_HUE_RANGE: f32 = 0.5;
 
+/// Rec.709 luminance weights. Mirrors `LUMA` in `grade.wgsl`.
+pub const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
 /// Resolution of each baked tone curve sent to the GPU.
 pub const CURVE_RES: usize = 1024;
 
@@ -57,8 +60,9 @@ pub struct Params {
     pub hue_lum: [f32; 8],
     /// Channel mixer, row-major (out R, G, B × in R, G, B), percent added to the identity.
     pub mixer: [f32; 9],
-    /// 1 = monochrome: every output channel takes the red row.
+    /// 1 = monochrome, weighted by luminance plus `mono_mix` (percent per input channel).
     pub mixer_mono: f32,
+    pub mono_mix: [f32; 3],
     /// Film colour: saturation in dye-density space (−100..100) and density
     /// of saturated colours (0..100).
     pub film_sat: f32,
@@ -162,6 +166,14 @@ impl Grade {
         self.neutralized() == *self
     }
 
+    /// The grade with a neutral input decoding: what a preset stores, since
+    /// the input belongs to the photo, not to the look.
+    pub fn neutral_input(&self) -> Self {
+        let mut g = self.clone();
+        (g.params.input, g.params.gamut) = (0, [0.0; 9]);
+        g
+    }
+
     /// Every stage bypassed: only the input decoding remains.
     pub fn neutralized(&self) -> Self {
         let mut n = self.clone();
@@ -185,7 +197,7 @@ impl Grade {
             Stage::Wheels => (p.lift, p.gamma, p.gain, p.offset) = (d.lift, d.gamma, d.gain, d.offset),
             Stage::Selective => (p.hue_shift, p.hue_sat, p.hue_lum) = (d.hue_shift, d.hue_sat, d.hue_lum),
             Stage::Curves => (0..HUE_HUE).for_each(|c| curves[c] = neutral_curve(c)),
-            Stage::Mixer => (p.mixer, p.mixer_mono) = (d.mixer, d.mixer_mono),
+            Stage::Mixer => (p.mixer, p.mixer_mono, p.mono_mix) = (d.mixer, d.mixer_mono, d.mono_mix),
             Stage::Film => (p.film_sat, p.film_density) = (d.film_sat, d.film_density),
             Stage::HueCurves => (HUE_HUE..=LUM_SAT).for_each(|c| curves[c] = neutral_curve(c)),
             Stage::Match => {
@@ -293,9 +305,9 @@ mod tests {
 
     #[test]
     fn params_layout_matches_wgsl() {
-        // 12 scalars + 4×4 wheels + 3×8 hue + mixer 9+1 + film 2 + match 1+6
+        // 12 scalars + 4×4 wheels + 3×8 hue + mixer 9+1+3 + film 2 + match 1+6
         // + input + 3×3 gamut + split,width,height,lut_size,overlay
-        assert_eq!(std::mem::size_of::<Params>(), (12 + 16 + 24 + 10 + 2 + 7 + 1 + 9 + 5) * 4);
+        assert_eq!(std::mem::size_of::<Params>(), (12 + 16 + 24 + 13 + 2 + 7 + 1 + 9 + 5) * 4);
     }
 
     #[test]
