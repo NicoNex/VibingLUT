@@ -6,9 +6,10 @@ use std::sync::{Arc, mpsc};
 
 use wgpu::util::DeviceExt;
 
-use crate::grade::{CURVE_RES, Grade, Params};
+use crate::grade::{CURVE_RES, CURVES, Grade, Params};
 use crate::lab::{self, Blend, Layer, Source, Stack};
 use crate::lut::{Format, Lut3d};
+use crate::matching::{self, Match};
 use crate::photo::{Photo, THUMB_MAX};
 use crate::profiles::Profile;
 use crate::scopes::Scopes;
@@ -43,6 +44,8 @@ pub struct GpuLut {
 }
 
 const WORKGROUP: u32 = 256;
+/// Pixels sampled per image for the reference match.
+const MATCH_SAMPLES: usize = 200_000;
 
 impl Gpu {
     pub fn new() -> Result<Self, String> {
@@ -88,7 +91,7 @@ impl Gpu {
             apply: pipeline("apply_lut"),
             bake: pipeline("bake"),
             params: uniform(std::mem::size_of::<Params>()),
-            curves: uniform(4 * CURVE_RES * 4),
+            curves: uniform(CURVES * CURVE_RES * 4),
             no_lut: uniform(16),
             name: format!("{} ({:?})", info.name, info.backend),
             device,
@@ -252,6 +255,17 @@ pub enum Job {
     /// Base of the Compare LUTs previews; None = the ungraded source.
     SetCompareBase(Option<CompareBase>),
     Render(Grade, f32),
+    /// The filmstrip photos (already preview-sized); `generation` lets the
+    /// UI drop frames of an older strip.
+    SetRoll(u64, Vec<Arc<Photo>>),
+    /// Every filmstrip photo through the grade and the look LUTs.
+    RenderRoll(Grade),
+    /// Colour transfer from the current photo (decoded by `input`, otherwise
+    /// ungraded) to a display-referred reference.
+    Match {
+        reference: Arc<Photo>,
+        input: Grade,
+    },
     /// The photo through the LUT file at `path` (kept on the GPU while selected).
     ApplyLut(PathBuf, f32),
     /// Thumbnails of the LUT files, read one at a time; `generation` lets
@@ -287,6 +301,7 @@ enum Slot {
     Gallery,
     Lab,
     Look,
+    Roll,
 }
 
 impl Job {
@@ -298,6 +313,7 @@ impl Job {
             Job::Gallery(..) => Some(Slot::Gallery),
             Job::Lab { .. } => Some(Slot::Lab),
             Job::SetLook(..) => Some(Slot::Look),
+            Job::RenderRoll(..) => Some(Slot::Roll),
             _ => None,
         }
     }
@@ -331,6 +347,14 @@ pub enum Done {
         rgba: Vec<u8>,
     },
     Exported(Result<PathBuf, String>),
+    RollFrame {
+        generation: u64,
+        index: usize,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    Matched(Match),
     /// A compared LUT file could not be read (deleted or broken since the scan).
     Unreadable(PathBuf, String),
 }
@@ -351,6 +375,8 @@ struct Worker {
     // ponytail: each pass re-reads the files (no lattice cache, keeps memory flat
     // for big libraries); cache by path + mtime if passes get slow.
     gallery: Option<(u64, Arc<Vec<PathBuf>>, usize)>,
+    /// Filmstrip photos on the GPU, with their generation.
+    roll: (u64, Vec<GpuPhoto>),
     /// Last grade baked for the Lab, reused until the grade changes.
     grade_lut: std::cell::RefCell<Option<(Grade, Arc<Lut3d>)>>,
 }
@@ -418,6 +444,23 @@ impl Worker {
                 let rgba = gpu.render(ph, &grade, self.look.as_ref(), split);
                 let scopes = Scopes::compute(&rgba, ph.width, ph.height, split);
                 notify(Done::Graded { width: ph.width, height: ph.height, rgba, scopes });
+            }
+            Job::SetRoll(generation, photos) => {
+                self.roll = (generation, photos.iter().map(|p| gpu.upload(p)).collect())
+            }
+            Job::RenderRoll(grade) => {
+                let generation = self.roll.0;
+                for (index, ph) in self.roll.1.iter().enumerate() {
+                    let rgba = gpu.render(ph, &grade, self.look.as_ref(), 0.0);
+                    notify(Done::RollFrame { generation, index, width: ph.width, height: ph.height, rgba });
+                }
+            }
+            Job::Match { reference, input } => {
+                let Some(ph) = &self.photo else { return };
+                // ponytail: 8-bit display render as the source sample, plenty for statistics.
+                let source = matching::samples_rgba8(&gpu.render(ph, &input, None, 0.0), MATCH_SAMPLES);
+                let reference = matching::samples_rgba_f32(&reference.pixels, MATCH_SAMPLES);
+                notify(Done::Matched(matching::transfer(&source, &reference)));
             }
             Job::ApplyLut(path, split) => {
                 let Some(ph) = &self.photo else { return };
@@ -490,7 +533,7 @@ pub fn spawn(notify: impl Fn(Done) + Send + 'static) -> mpsc::Sender<Job> {
                 };
                 // Keep only the newest job per slot, preserving order otherwise.
                 let mut batch: Vec<Job> = first.into_iter().chain(rx.try_iter()).collect();
-                let mut seen = [false; 5];
+                let mut seen = [false; 6];
                 batch.reverse();
                 batch.retain(|j| j.slot().is_none_or(|s| !std::mem::replace(&mut seen[s as usize], true)));
                 batch.reverse();
@@ -530,7 +573,11 @@ mod tests {
         grade.params.temperature = 30.0;
         grade.params.saturation = 20.0;
         grade.params.hue_shift[5] = 40.0;
+        (grade.params.film_sat, grade.params.film_density, grade.params.mixer[1]) = (40.0, 50.0, 15.0);
+        (grade.params.match_amount, grade.params.match_ab) = (60.0, [0.1, 0.02, -0.03, 0.05, 0.01, -0.005]);
         grade.curves[0] = vec![(0.0, 0.05), (0.5, 0.55), (1.0, 0.95)];
+        grade.curves[crate::grade::HUE_SAT] = vec![(0.0, 0.5), (0.6, 0.7), (1.0, 0.5)];
+        grade.curves[crate::grade::MATCH_L] = vec![(0.0, 0.03), (0.5, 0.47), (1.0, 0.97)];
         let photo = Photo {
             width: 64,
             height: 1,
@@ -549,6 +596,53 @@ mod tests {
         let mean = diff.iter().map(|&d| d as f32).sum::<f32>() / diff.len() as f32;
         // ponytail: peak error comes from out-of-gamut clamping of strongly saturated darks.
         assert!(worst <= 8 && mean < 0.5, "65³ LUT vs direct grade: worst {worst}/255, mean {mean}");
+    }
+
+    /// Film colour leaves neutrals alone and makes colours denser, never
+    /// lighter; the monochrome mixer outputs grey; the clipping overlay marks
+    /// only pixels that clip.
+    #[test]
+    fn film_mixer_and_overlay() {
+        let Ok(gpu) = Gpu::new() else { return eprintln!("no GPU, skipped") };
+        let px = [[0.5, 0.5, 0.5], [0.8, 0.3, 0.2], [0.2, 0.5, 0.8], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0]];
+        let photo = Photo { width: 5, height: 1, pixels: px.iter().map(|&[r, g, b]| [r, g, b, 1.0]).collect() };
+        let gp = gpu.upload(&photo);
+        let render = |g: &Grade| gpu.render(&gp, g, None, 0.0);
+        let luma =
+            |o: &[u8], i: usize| 0.2126 * o[i * 4] as f32 + 0.7152 * o[i * 4 + 1] as f32 + 0.0722 * o[i * 4 + 2] as f32;
+        let plain = render(&Grade::default());
+        for (k, v) in [("film_sat", 60.0), ("film_density", 80.0)] {
+            let mut g = Grade::default();
+            if k == "film_sat" {
+                g.params.film_sat = v
+            } else {
+                g.params.film_density = v
+            }
+            let out = render(&g);
+            assert!((0..3).all(|c| out[c].abs_diff(plain[c]) <= 1), "{k} moved grey: {:?}", &out[..4]);
+            for i in [1, 2] {
+                assert!(luma(&out, i) < luma(&plain, i) - 2.0, "{k} did not darken colour {i}");
+            }
+        }
+        let mut g = Grade::default();
+        g.params.mixer_mono = 1.0;
+        let out = render(&g);
+        for i in 0..5 {
+            assert!(
+                out[i * 4].abs_diff(out[i * 4 + 1]) <= 1 && out[i * 4].abs_diff(out[i * 4 + 2]) <= 1,
+                "mono pixel {i} not grey"
+            );
+        }
+        let mut g = Grade::default();
+        g.params.exposure = 1.5;
+        let bright = render(&g);
+        g.params.overlay = 1;
+        // 5×1 image: stripes cover x + y in 4..8, i.e. pixel 4 only.
+        let marked = render(&g);
+        assert_eq!(&marked[..16], &bright[..16]);
+        let mut g = Grade::default();
+        g.params.overlay = 1;
+        assert_eq!(&render(&g)[16..19], &[46, 107, 255], "crushed black not marked");
     }
 
     /// A look made of an identity LUT leaves the exported grade unchanged;

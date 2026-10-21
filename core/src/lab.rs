@@ -182,7 +182,7 @@ fn mix_oklab(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 
 /// Display-encoded sRGB → OKLab (Ottosson's published constants, kept verbatim).
 #[allow(clippy::excessive_precision)]
-fn to_oklab(c: [f32; 3]) -> [f32; 3] {
+pub(crate) fn to_oklab(c: [f32; 3]) -> [f32; 3] {
     let [r, g, b] = c.map(srgb_invert_gamma);
     let lms = [
         0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b,

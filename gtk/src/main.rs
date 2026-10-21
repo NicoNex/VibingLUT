@@ -1806,6 +1806,8 @@ impl App {
                 self.toast(&gettext!("LUT saved: {}", p.file_name().unwrap_or_default().to_string_lossy()))
             }
             Done::Exported(Err(e)) => self.toast(&gettext!("Export failed: {}", e)),
+            // Wired up with the filmstrip and Match UI.
+            Done::RollFrame { .. } | Done::Matched(_) => {}
             Done::Unreadable(p, e) => {
                 self.ui.compare_stack.set_visible_child_name("empty");
                 self.toast(&gettext!("Cannot read {}: {}", p.display(), e));

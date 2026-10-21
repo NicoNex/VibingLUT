@@ -8,7 +8,9 @@ struct Params {
     saturation: f32, vibrance: f32, sat_shadows: f32, sat_highlights: f32,
     lift: array<f32, 4>, gamma: array<f32, 4>, gain: array<f32, 4>, offset: array<f32, 4>,
     hue_shift: array<f32, 8>, hue_sat: array<f32, 8>, hue_lum: array<f32, 8>,
-    input: u32, gamut: array<f32, 9>, split: f32, width: u32, height: u32, lut_size: u32,
+    mixer: array<f32, 9>, mixer_mono: f32, film_sat: f32, film_density: f32,
+    match_amount: f32, match_ab: array<f32, 6>,
+    input: u32, gamut: array<f32, 9>, split: f32, width: u32, height: u32, lut_size: u32, overlay: u32,
 }
 
 @group(0) @binding(0) var<storage, read> p: Params;
@@ -19,6 +21,11 @@ struct Params {
 @group(0) @binding(5) var<storage, read> ext_lut: array<vec4<f32>>;
 
 const CURVE_RES: u32 = 1024u;
+// Curve channels (grade.rs): 0 master, 1-3 R G B, then these.
+const HUE_HUE: u32 = 4u;
+const HUE_SAT: u32 = 5u;
+const LUM_SAT: u32 = 6u;
+const MATCH_L: u32 = 7u;
 const LUMA = vec3<f32>(0.2126, 0.7152, 0.0722);
 const MID_GREY: f32 = 0.18;
 
@@ -169,6 +176,31 @@ fn tone(c: vec3<f32>) -> vec3<f32> {
     return c * (MID_GREY * exp2(s) / y);
 }
 
+// ----------------------------------------------------------- channel mixer
+// Scene-linear, so it behaves like a filter in front of the sensor. Each row
+// is normalised to sum 1: neutrals stay neutral whatever the mix.
+
+fn mix_row(r: vec3<f32>, c: vec3<f32>) -> f32 {
+    let sum = r.x + r.y + r.z;
+    return dot(select(r, r / sum, abs(sum) > 0.05), c);
+}
+
+fn mixer(c: vec3<f32>) -> vec3<f32> {
+    let m = p.mixer;
+    let row0 = vec3(m[0], m[1], m[2]) * 0.01;
+    if p.mixer_mono > 0.5 {
+        // Black & white: luminance weights plus the red row as a colour filter.
+        return vec3(max(mix_row(LUMA + row0, c), 0.0));
+    }
+    if all(row0 == vec3(0.0)) && m[3] == 0.0 && m[4] == 0.0 && m[5] == 0.0 && m[6] == 0.0 && m[7] == 0.0 && m[8] == 0.0 {
+        return c;
+    }
+    return vec3(
+        mix_row(vec3(1.0, 0.0, 0.0) + row0, c),
+        mix_row(vec3(0.0, 1.0, 0.0) + vec3(m[3], m[4], m[5]) * 0.01, c),
+        mix_row(vec3(0.0, 0.0, 1.0) + vec3(m[6], m[7], m[8]) * 0.01, c));
+}
+
 // ------------------------------------------------------------------ OKLab
 
 fn cbrt(v: vec3<f32>) -> vec3<f32> { return sign(v) * pow(abs(v), vec3(1.0 / 3.0)); }
@@ -224,6 +256,12 @@ fn color(c: vec3<f32>) -> vec3<f32> {
     var hue = atan2(lab.z, lab.y);
     if hue < 0.0 { hue += TAU; }
     let w = smoothstep(0.0, 0.06, chroma); // leave neutrals alone
+    // Hue curves, read at the original hue: offsets around 0.5.
+    let h01 = hue / TAU;
+    let hh = (curve(HUE_HUE, h01) - 0.5) * 2.0;  // ±1 rad ≈ ±57°
+    chroma *= max(0.0, 1.0 + (curve(HUE_SAT, h01) * 2.0 - 1.0) * w);
+    chroma *= curve(LUM_SAT, clamp(lab.x, 0.0, 1.0)) * 2.0;
+    hue += hh * w;
     hue += band(p.hue_shift, hue) * 0.005 * w;   // ±0.5 rad ≈ ±29°
     var l = lab.x * (1.0 + band(p.hue_lum, hue) * 0.004 * w);
     chroma *= max(0.0, 1.0 + band(p.hue_sat, hue) * 0.01 * w);
@@ -233,6 +271,52 @@ fn color(c: vec3<f32>) -> vec3<f32> {
     let lv = lab.x;
     chroma *= max(0.0, 1.0 + 0.01 * (p.sat_shadows * (1.0 - smoothstep(0.15, 0.55, lv)) + p.sat_highlights * smoothstep(0.55, 0.95, lv)));
     return oklab_to_lin(vec3(l, chroma * cos(hue), chroma * sin(hue)));
+}
+
+// ------------------------------------------------------------ film colour
+// Film makes colour by adding dye, and dye only removes light: a more
+// saturated colour is also a denser, darker one. Saturation is therefore
+// applied in optical density (−log2 of each channel) and anchored at the
+// least dense channel, which keeps its value; the others gain or lose
+// density. Neutrals have equal densities and are untouched.
+
+fn film_saturation(c: vec3<f32>) -> vec3<f32> {
+    let s = p.film_sat * 0.01;
+    if s == 0.0 { return c; }
+    let d = -log2(max(c, vec3(1e-6)));
+    let d0 = min(d.r, min(d.g, d.b));
+    // Fade out in deep shadows, where noise would be stretched into colour.
+    let k = s * smoothstep(0.0005, 0.01, max(c.r, max(c.g, c.b)));
+    return exp2(-(d0 + (d - d0) * (1.0 + k)));
+}
+
+// Density of saturated colours: lightness drops with chroma at constant hue
+// and chroma, the "rich" colour of reversal film. Lightness is reduced in
+// proportion so blacks stay black and highlights keep their order.
+fn film_density(c: vec3<f32>) -> vec3<f32> {
+    let k = p.film_density * 0.01;
+    if k == 0.0 { return c; }
+    let lab = lin_to_oklab(c);
+    let chroma = length(lab.yz);
+    let l = lab.x * (1.0 - 0.4 * k * smoothstep(0.0, 0.25, chroma));
+    return oklab_to_lin(vec3(l, lab.yz));
+}
+
+// ---------------------------------------------------------- reference match
+// Transfers a reference photo's colour: its lightness distribution through a
+// monotone L→L curve and its a/b mean and covariance through an affine map
+// (both computed in match.rs), blended by the match strength.
+
+fn match_reference(c: vec3<f32>) -> vec3<f32> {
+    let k = p.match_amount * 0.01;
+    if k == 0.0 { return c; }
+    let lab = lin_to_oklab(c);
+    let m = p.match_ab;
+    let ab = vec2(
+        (1.0 + m[0]) * lab.y + m[1] * lab.z + m[4],
+        m[2] * lab.y + (1.0 + m[3]) * lab.z + m[5]);
+    let out = vec3(curve(MATCH_L, clamp(lab.x, 0.0, 1.0)), ab);
+    return oklab_to_lin(mix(lab, out, k));
 }
 
 // ------------------------------------------------------- gamut / highlight
@@ -264,12 +348,16 @@ fn curve(i: u32, v: f32) -> f32 {
     return mix(curves[base + k], curves[base + k + 1u], x - f32(k));
 }
 
-fn grade(input: vec3<f32>) -> vec3<f32> {
+// The grade before its final clamp, so the preview can see what clips.
+fn grade_unclamped(input: vec3<f32>) -> vec3<f32> {
     var c = srgb_to_lin(to_display(input));
+    c = match_reference(c);
     c = white_balance(c);
     c *= exp2(p.exposure);
+    c = mixer(c);
     c = tone(c);
     c = color(c);
+    c = film_density(film_saturation(c));
     var d = lin_to_srgb(fit_gamut(c));
 
     // Levels: whites/blacks move the end points.
@@ -286,9 +374,15 @@ fn grade(input: vec3<f32>) -> vec3<f32> {
     d *= gain;
     d = pow(max(d, vec3(0.0)), 1.0 / gamma);
 
-    // Master curve, then per-channel curves.
+    // Master curve, then per-channel curves (they clamp their input to 0..1,
+    // so out-of-range values are carried over as the excess).
+    let excess = d - clamp(d, vec3(0.0), vec3(1.0));
     d = vec3(curve(1u, curve(0u, d.r)), curve(2u, curve(0u, d.g)), curve(3u, curve(0u, d.b)));
-    return clamp(d, vec3(0.0), vec3(1.0));
+    return d + excess;
+}
+
+fn grade(input: vec3<f32>) -> vec3<f32> {
+    return clamp(grade_unclamped(input), vec3(0.0), vec3(1.0));
 }
 
 // ---------------------------------------------------------------- 3D LUT
@@ -350,15 +444,32 @@ fn finish(idx: u32, after: vec3<f32>, before: vec3<f32>) -> u32 {
     return pack(after);
 }
 
+// Clipping overlay: diagonal stripes over the pixels the output loses.
+// Red = highlights clipped, blue = blacks crushed, yellow = a channel
+// pushed out of the display gamut (the colour shifts when it is clamped).
+fn mark_clipping(idx: u32, raw: vec3<f32>) -> vec3<f32> {
+    let g = clamp(raw, vec3(0.0), vec3(1.0));
+    let x = idx % p.width;
+    let y = idx / p.width;
+    if ((x + y) / 4u) % 2u == 0u { return g; }
+    if all(g >= vec3(0.996)) || (any(raw > vec3(1.002)) && min(g.r, min(g.g, g.b)) > 0.9) {
+        return vec3(1.0, 0.16, 0.16);
+    }
+    if all(g <= vec3(0.004)) { return vec3(0.18, 0.42, 1.0); }
+    if any(raw > vec3(1.002)) || any(raw < vec3(-0.002)) { return vec3(1.0, 0.86, 0.1); }
+    return g;
+}
+
 @compute @workgroup_size(256)
 fn preview(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if idx >= p.width * p.height { return; }
     let c = src[idx].rgb;
     // Optional look LUT after the grade (lut_size 0 = none).
-    var g = grade(c);
-    if p.lut_size > 0u { g = tetrahedral(g); }
-    dst_px[idx] = finish(idx, g, c);
+    var g = grade_unclamped(c);
+    if p.lut_size > 0u { g = tetrahedral(clamp(g, vec3(0.0), vec3(1.0))); }
+    if p.overlay == 1u { g = mark_clipping(idx, g); }
+    dst_px[idx] = finish(idx, clamp(g, vec3(0.0), vec3(1.0)), c);
 }
 
 @compute @workgroup_size(256)
