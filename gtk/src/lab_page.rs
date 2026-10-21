@@ -182,10 +182,10 @@ pub fn build(sender: &ComponentSender<App>, export_menu: &gio::Menu) -> LabUi {
     rh.set_margin_top(6);
     result.append(&rh);
     result.append(&input);
-    result.append(&caption(
-        "Il Photo Style / log della camera su cui caricherai il LUT esportato. Il segnale viene convertito \
-         automaticamente nel profilo di ogni livello.",
-    ));
+    result.append(&caption(&gettext(
+        "The camera Photo Style / log you will load the exported LUT on. The signal is converted \
+         automatically to each layer's profile.",
+    )));
     panel.append(&result);
 
     // How layers combine (only matters with two or more).
