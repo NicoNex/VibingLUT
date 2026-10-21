@@ -351,6 +351,9 @@ impl ColorWheel {
         });
         let r = resetting.clone();
         drag.connect_drag_end(move |_, _, _| r.set(false));
+        // A cancelled sequence never reaches drag-end: unmute here too.
+        let r = resetting.clone();
+        drag.connect_cancel(move |_, _| r.set(false));
         area.add_controller(drag);
         let dbl = gtk::GestureClick::new();
         let (t, r) = (this.clone(), resetting);

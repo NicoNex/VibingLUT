@@ -308,11 +308,32 @@ impl Job {
 pub enum Done {
     Ready(String),
     Failed(String),
-    Graded { width: u32, height: u32, rgba: Vec<u8>, scopes: Scopes },
-    Compared { width: u32, height: u32, rgba: Vec<u8> },
-    Lab { width: u32, height: u32, rgba: Vec<u8> },
-    Thumb { generation: u64, index: usize, width: u32, height: u32, rgba: Vec<u8> },
+    Graded {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        scopes: Scopes,
+    },
+    Compared {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    Lab {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    Thumb {
+        generation: u64,
+        index: usize,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
     Exported(Result<PathBuf, String>),
+    /// A compared LUT file could not be read (deleted or broken since the scan).
+    Unreadable(PathBuf, String),
 }
 
 #[derive(Default)]
@@ -320,13 +341,16 @@ struct Worker {
     source: Option<Arc<Photo>>,
     photo: Option<GpuPhoto>,
     thumb: Option<GpuPhoto>,
-    /// The LUT shown in the comparison view.
-    selected: Option<(PathBuf, GpuLut)>,
+    /// The LUT shown in the comparison view, with the file's modification time
+    /// so an edited file is re-read.
+    selected: Option<(PathBuf, Option<std::time::SystemTime>, GpuLut)>,
     /// Composite of the Grade page's look LUTs.
     look: Option<GpuLut>,
     /// Compare base composed at 33³ (thumbnails) and 65³ (large preview).
     base: Option<(Lut3d, Lut3d)>,
     /// Thumbnail pass in progress: generation, LUT files, next index.
+    // ponytail: each pass re-reads the files (no lattice cache, keeps memory flat
+    // for big libraries); cache by path + mtime if passes get slow.
     gallery: Option<(u64, Arc<Vec<PathBuf>>, usize)>,
     /// Last grade baked for the Lab, reused until the grade changes.
     grade_lut: std::cell::RefCell<Option<(Grade, Arc<Lut3d>)>>,
@@ -398,19 +422,23 @@ impl Worker {
             }
             Job::ApplyLut(path, split) => {
                 let Some(ph) = &self.photo else { return };
-                if self.selected.as_ref().is_none_or(|(p, _)| *p != path) {
+                let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                if self.selected.as_ref().is_none_or(|(p, t, _)| *p != path || *t != mtime) {
                     match Lut3d::load(&path) {
                         Ok(l) => {
                             let l = match &self.base {
                                 Some((_, large)) => after(large, &l),
                                 None => l,
                             };
-                            self.selected = Some((path, gpu.upload_lut(&l)))
+                            self.selected = Some((path, mtime, gpu.upload_lut(&l)))
                         }
-                        Err(_) => return,
+                        Err(e) => {
+                            self.selected = None;
+                            return notify(Done::Unreadable(path, e));
+                        }
                     }
                 }
-                let lut = &self.selected.as_ref().expect("loaded above").1;
+                let lut = &self.selected.as_ref().expect("loaded above").2;
                 let rgba = gpu.apply_lut(ph, lut, split);
                 notify(Done::Compared { width: ph.width, height: ph.height, rgba });
             }

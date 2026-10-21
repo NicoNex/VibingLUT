@@ -167,7 +167,9 @@ impl Lut3d {
 
     /// 16-bit HALD CLUT image; requires size = L² (e.g. 64 → level 8, 512×512).
     pub fn to_hald(&self) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>, String> {
-        let level = (2..=16).find(|l| l * l == self.size).ok_or(format!("{}³ is not a HALD size (L²)", self.size))?;
+        // Same level range the reader accepts, so every HALD we write reads back.
+        let level =
+            (2..=12).find(|l| l * l == self.size).ok_or(format!("{}³ is not a HALD size (L², L ≤ 12)", self.size))?;
         let side = (level * level * level) as u32;
         let px: Vec<u16> =
             self.data.iter().flat_map(|c| c.map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16)).collect();
@@ -254,9 +256,9 @@ impl Lut3d {
 
     /// Every LUT (`.cube`, `.vlt`, HALD `.png`) under `dir`, recursively,
     /// sorted by sub-folder then name (at most [`MAX_LIBRARY`]); plus one
-    /// message per file that failed to parse. Files are validated here but
-    /// their lattices are dropped.
-    pub fn load_dir(dir: &Path) -> (Vec<LutEntry>, Vec<String>) {
+    /// message per file that failed to parse, and whether the cap cut the list
+    /// short. Files are validated here but their lattices are dropped.
+    pub fn load_dir(dir: &Path) -> (Vec<LutEntry>, Vec<String>, bool) {
         let mut paths = Vec::new();
         collect_luts(dir, &mut paths);
         let group = |p: &Path| {
@@ -266,7 +268,7 @@ impl Lut3d {
                 .unwrap_or_default()
         };
         paths.sort_by_cached_key(|p| (group(p), p.file_name().map(|n| n.to_ascii_lowercase())));
-        let (mut luts, mut errors) = (Vec::new(), Vec::new());
+        let (mut luts, mut errors, mut truncated) = (Vec::new(), Vec::new(), false);
         for p in paths {
             let png = Format::from_path(&p) == Some(Format::Hald);
             // A PNG beside a text LUT of the same name is that LUT's preview.
@@ -278,6 +280,7 @@ impl Lut3d {
                 continue;
             }
             if luts.len() >= MAX_LIBRARY {
+                truncated = true;
                 break;
             }
             match Self::load(&p) {
@@ -289,7 +292,7 @@ impl Lut3d {
                 Err(e) => errors.push(format!("{}: {e}", p.strip_prefix(dir).unwrap_or(&p).display())),
             }
         }
-        (luts, errors)
+        (luts, errors, truncated)
     }
 }
 
@@ -400,7 +403,7 @@ mod tests {
         });
         noise.save(root.join("b.png")).unwrap();
         noise.save(root.join("photo.png")).unwrap();
-        let (luts, errors) = Lut3d::load_dir(&root);
+        let (luts, errors, _) = Lut3d::load_dir(&root);
         std::fs::remove_dir_all(&root).unwrap();
         let got: Vec<_> = luts.iter().map(|l| format!("{}/{}", l.group, l.title)).collect();
         let kodak = format!("Film{}Kodak/a", std::path::MAIN_SEPARATOR);

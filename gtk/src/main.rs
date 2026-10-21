@@ -70,7 +70,7 @@ enum Msg {
     ExportTo(Format, usize, What, PathBuf),
     ChooseFolder,
     Folder(PathBuf),
-    GalleryLoaded(Vec<LutEntry>, Vec<String>),
+    GalleryLoaded(Vec<LutEntry>, Vec<String>, bool),
     Group(u32),
     Search(String),
     /// Rescans the LUT folder.
@@ -140,6 +140,10 @@ struct App {
     looks_off: bool,
     /// What the Compare base was last built from: grade, looks (by identity), profile.
     base_key: Option<BaseKey>,
+    /// Keeps the keyed look LUTs alive, so their addresses cannot be reused by another LUT.
+    base_luts: Vec<Arc<Lut3d>>,
+    /// Thumbnails need re-rendering (new source or library) next time Compare is shown.
+    gallery_stale: bool,
     lab_input: Profile,
     lab_blend: Blend,
     profile: Profile,
@@ -205,8 +209,8 @@ impl App {
         self.sent = None;
         self.ui.export.set_sensitive(true);
         self.ui.grade_stack.set_visible_child_name("image");
+        self.gallery_stale = true;
         self.refresh();
-        self.render_gallery();
     }
 
     /// The grade as previewed and exported: switched-off sections are neutral.
@@ -257,6 +261,13 @@ impl App {
             return false;
         }
         self.base_key = key;
+        self.base_luts = looks
+            .iter()
+            .filter_map(|l| match &l.source {
+                Source::Lut(lut) => Some(lut.clone()),
+                _ => None,
+            })
+            .collect();
         let mut neutral = Grade::default();
         (neutral.params.input, neutral.params.gamut) = (grade.params.input, grade.params.gamut);
         // ponytail: an untouched grade keeps the exact direct path (no lattice round trip).
@@ -266,8 +277,8 @@ impl App {
     }
 
     fn render_gallery(&mut self) {
-        self.sync_compare_base();
         if self.has_source() && !self.luts.is_empty() {
+            self.gallery_stale = false;
             self.gallery_gen += 1;
             self.send(Job::Gallery(self.gallery_gen, self.lut_paths.clone()));
         }
@@ -278,7 +289,8 @@ impl App {
         match self.page {
             Page::Grade => self.render(),
             Page::Compare => {
-                if self.sync_compare_base() {
+                // Thumbnails are rendered only for this page, when their inputs changed.
+                if self.sync_compare_base() || self.gallery_stale {
                     self.render_gallery();
                 }
                 self.render_compare()
@@ -1320,6 +1332,8 @@ impl SimpleComponent for App {
             bypassed: Vec::new(),
             looks_off: false,
             base_key: None,
+            base_luts: Vec::new(),
+            gallery_stale: true,
             lab_input: Profile::Standard,
             lab_blend: Blend::Chain,
             profile: Profile::Standard,
@@ -1553,17 +1567,17 @@ impl SimpleComponent for App {
                     .set_label(&dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
                 let s = sender.input_sender().clone();
                 std::thread::spawn(move || {
-                    let (luts, errors) = Lut3d::load_dir(&dir);
-                    s.emit(Msg::GalleryLoaded(luts, errors));
+                    let (luts, errors, truncated) = Lut3d::load_dir(&dir);
+                    s.emit(Msg::GalleryLoaded(luts, errors, truncated));
                 });
             }
-            Msg::GalleryLoaded(luts, errors) => {
+            Msg::GalleryLoaded(luts, errors, truncated) => {
                 if !errors.is_empty() {
                     self.toast(&gettext!("{} files skipped: {}", errors.len(), errors.join("; ")));
                 }
                 self.ui.flow.remove_all();
                 self.ui.thumbs.clear();
-                if luts.len() >= MAX_LIBRARY {
+                if truncated {
                     self.toast(&gettext!("Very large library: showing the first {} LUTs", MAX_LIBRARY));
                 }
                 for lut in &luts {
@@ -1613,7 +1627,10 @@ impl SimpleComponent for App {
                 self.filter_gallery();
                 self.selected = None;
                 self.ui.compare_stack.set_visible_child_name("empty");
-                self.render_gallery();
+                self.gallery_stale = true;
+                if matches!(self.page, Page::Compare) {
+                    self.refresh();
+                }
                 if let Some(c) = self.ui.flow.child_at_index(0) {
                     self.ui.flow.select_child(&c);
                 }
@@ -1744,13 +1761,15 @@ impl SimpleComponent for App {
                     self.layers_changed(which, false, &sender);
                 }
             }
+            // Only the summary depends on these; the rows stay as they are.
             Msg::LabInput(p) => {
                 self.lab_input = p;
-                self.lab_changed(true, &sender);
+                self.ui.lab.refresh_summary(&self.lab_layers, self.lab_blend, self.lab_input);
             }
             Msg::LabBlend(b) => {
                 self.lab_blend = b;
-                self.lab_changed(true, &sender);
+                self.ui.lab.refresh_summary(&self.lab_layers, self.lab_blend, self.lab_input);
+                self.render_lab();
             }
             Msg::Page(page) => {
                 self.page = page;
@@ -1790,6 +1809,10 @@ impl App {
                 self.toast(&gettext!("LUT saved: {}", p.file_name().unwrap_or_default().to_string_lossy()))
             }
             Done::Exported(Err(e)) => self.toast(&gettext!("Export failed: {}", e)),
+            Done::Unreadable(p, e) => {
+                self.ui.compare_stack.set_visible_child_name("empty");
+                self.toast(&gettext!("Cannot read {}: {}", p.display(), e));
+            }
         }
     }
 }
