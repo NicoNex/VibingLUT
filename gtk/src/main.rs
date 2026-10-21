@@ -140,8 +140,6 @@ struct App {
     looks_off: bool,
     /// What the Compare base was last built from: grade, looks (by identity), profile.
     base_key: Option<BaseKey>,
-    /// Keeps the keyed look LUTs alive, so their addresses cannot be reused by another LUT.
-    base_luts: Vec<Arc<Lut3d>>,
     /// Thumbnails need re-rendering (new source or library) next time Compare is shown.
     gallery_stale: bool,
     lab_input: Profile,
@@ -223,8 +221,9 @@ impl App {
     fn render(&mut self) {
         let req = Some((self.graded(), self.split_value()));
         if self.has_source() && self.sent != req {
-            self.send(Job::Render(self.graded(), self.split_value()));
             self.sent = req;
+            let (grade, split) = self.sent.clone().expect("set above");
+            self.send(Job::Render(grade, split));
         }
     }
 
@@ -249,29 +248,20 @@ impl App {
     /// Hands the Grade page's result to Compare LUTs; true when it changed.
     fn sync_compare_base(&mut self) -> bool {
         let (grade, looks, input) = (self.graded(), self.look_layers(), self.source_profile());
-        let ids = looks
+        let luts = looks
             .iter()
-            .map(|l| match &l.source {
-                Source::Lut(lut) => (Arc::as_ptr(lut) as usize, l.intensity.to_bits(), l.input),
-                _ => (0, 0, l.input),
+            .filter_map(|l| match &l.source {
+                Source::Lut(lut) => Some((lut.clone(), l.intensity, l.input)),
+                _ => None,
             })
             .collect();
-        let key = Some((grade.clone(), ids, input));
+        let key = Some(BaseKey { grade: grade.clone(), luts, input });
         if self.base_key == key {
             return false;
         }
         self.base_key = key;
-        self.base_luts = looks
-            .iter()
-            .filter_map(|l| match &l.source {
-                Source::Lut(lut) => Some(lut.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut neutral = Grade::default();
-        (neutral.params.input, neutral.params.gamut) = (grade.params.input, grade.params.gamut);
         // ponytail: an untouched grade keeps the exact direct path (no lattice round trip).
-        let base = (grade != neutral || !looks.is_empty()).then_some(CompareBase { grade, looks, input });
+        let base = (!grade.is_neutral() || !looks.is_empty()).then_some(CompareBase { grade, looks, input });
         self.send(Job::SetCompareBase(base));
         true
     }
@@ -281,6 +271,15 @@ impl App {
             self.gallery_stale = false;
             self.gallery_gen += 1;
             self.send(Job::Gallery(self.gallery_gen, self.lut_paths.clone()));
+        }
+    }
+
+    /// Re-renders the view on screen after a split change: nothing else moved.
+    fn redraw(&mut self) {
+        match self.page {
+            Page::Grade => self.render(),
+            Page::Compare => self.render_compare(),
+            Page::Lab => self.render_lab(),
         }
     }
 
@@ -300,17 +299,16 @@ impl App {
     }
 
     fn lab_job_layers(&self) -> Vec<Layer> {
-        self.lab_layers
-            .iter()
-            .map(|l| {
-                let (source, input) = match &l.kind {
-                    LabKind::Lut(lut) => (Source::Lut(lut.clone()), l.input),
-                    LabKind::Grade => (Source::Grade(Box::new(self.graded())), self.source_profile()),
-                    LabKind::Convert(p) => (Source::Convert(*p), *p),
-                };
-                Layer { source, intensity: l.intensity, input }
-            })
-            .collect()
+        self.lab_layers.iter().map(|l| self.job_layer(l)).collect()
+    }
+
+    fn job_layer(&self, l: &LabLayer) -> Layer {
+        let (source, input) = match &l.kind {
+            LabKind::Lut(lut) => (Source::Lut(lut.clone()), l.input),
+            LabKind::Grade => (Source::Grade(Box::new(self.graded())), self.source_profile()),
+            LabKind::Convert(p) => (Source::Convert(*p), *p),
+        };
+        Layer { source, intensity: l.intensity, input }
     }
 
     fn lab_stack(&self, input: Profile) -> Stack {
@@ -388,15 +386,7 @@ impl App {
         if self.looks_off {
             return Vec::new();
         }
-        self.looks
-            .iter()
-            .filter_map(|l| match &l.kind {
-                LabKind::Lut(lut) => {
-                    Some(Layer { source: Source::Lut(lut.clone()), intensity: l.intensity, input: l.input })
-                }
-                _ => None,
-            })
-            .collect()
+        self.looks.iter().map(|l| self.job_layer(l)).collect()
     }
 
     fn lab_changed(&mut self, structure: bool, sender: &ComponentSender<Self>) {
@@ -417,7 +407,6 @@ fn texture(width: u32, height: u32, rgba: Vec<u8>) -> gdk::MemoryTexture {
 }
 
 /// Card with a collapsible header, like the sections of a grading panel.
-/// Collapsible card.
 fn section(title: &str, child: &impl IsA<gtk::Widget>) -> gtk::Box {
     section_with(title, child, None)
 }
@@ -800,17 +789,12 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
     // LUTs after the grade
     let look_box = vbox(8);
     let looks = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
-    looks.set_placeholder(Some(
-        &gtk::Label::builder()
-            .label(gettext("No LUTs: the grade is exported as is."))
-            .css_classes(["dim-label", "caption"])
-            .wrap(true)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
-            .build(),
-    ));
+    let empty = lab_page::caption(&gettext("No LUTs: the grade is exported as is."));
+    empty.set_margin_top(12);
+    empty.set_margin_bottom(12);
+    empty.set_margin_start(12);
+    empty.set_margin_end(12);
+    looks.set_placeholder(Some(&empty));
     look_box.append(&looks);
     let add_menu = gio::Menu::new();
     add_menu.append(Some(gettext("LUT from file…").as_str()), Some("win.look-add::file"));
@@ -823,14 +807,9 @@ fn build_sidebar(sender: &ComponentSender<App>) -> Sidebar {
             .css_classes(["pill"])
             .build(),
     );
-    look_box.append(
-        &gtk::Label::builder()
-            .label(gettext("Applied after the grade, top to bottom, and included in the exported LUT."))
-            .css_classes(["dim-label", "caption"])
-            .wrap(true)
-            .xalign(0.0)
-            .build(),
-    );
+    look_box.append(&lab_page::caption(&gettext(
+        "Applied after the grade, top to bottom, and included in the exported LUT.",
+    )));
     panel.append(&bypassable(&gettext("LUTs"), &look_box, None, sender));
 
     let reset = gtk::Button::builder()
@@ -1332,7 +1311,6 @@ impl SimpleComponent for App {
             bypassed: Vec::new(),
             looks_off: false,
             base_key: None,
-            base_luts: Vec::new(),
             gallery_stale: true,
             lab_input: Profile::Standard,
             lab_blend: Blend::Chain,
@@ -1481,19 +1459,17 @@ impl SimpleComponent for App {
                     l.reset();
                 }
                 self.ui.sidebar.curves.reset_all();
-                let (input, gamut) = (self.grade.params.input, self.grade.params.gamut);
-                self.grade = Grade::default();
-                (self.grade.params.input, self.grade.params.gamut) = (input, gamut);
+                Stage::ALL.into_iter().for_each(|s| self.grade.bypass(s));
                 self.render();
             }
             Msg::Compare(on) => {
                 self.compare = on;
-                self.refresh();
+                self.redraw();
             }
             Msg::Split(x) => {
                 if self.compare {
                     self.split = x;
-                    self.refresh();
+                    self.redraw();
                 }
             }
             // Ctrl+E fires even while the button is insensitive.
@@ -1895,8 +1871,24 @@ fn locale_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/locale")))
 }
 
-/// Grade, look LUTs (pointer, intensity bits, profile) and source profile.
-type BaseKey = (Grade, Vec<(usize, u32, Profile)>, Profile);
+/// What the Compare base is built from; look LUTs compare by identity, not content.
+struct BaseKey {
+    grade: Grade,
+    luts: Vec<(Arc<Lut3d>, f32, Profile)>,
+    input: Profile,
+}
+
+impl PartialEq for BaseKey {
+    fn eq(&self, o: &Self) -> bool {
+        let same = |a: &(Arc<Lut3d>, f32, Profile), b: &(Arc<Lut3d>, f32, Profile)| {
+            Arc::ptr_eq(&a.0, &b.0) && a.1 == b.1 && a.2 == b.2
+        };
+        self.grade == o.grade
+            && self.input == o.input
+            && self.luts.len() == o.luts.len()
+            && self.luts.iter().zip(&o.luts).all(|(a, b)| same(a, b))
+    }
+}
 
 thread_local! {
     /// The window's input, for files opened through the application (see `main`).

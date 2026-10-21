@@ -212,10 +212,8 @@ impl Gpu {
         }
         // Grade baked on the export lattice itself, so its nodes are exact.
         let baked = Arc::new(baked);
-        let grade = Layer { source: Source::Grade(Box::new(grade)), intensity: 1.0, input: Profile::Standard };
-        let layers = std::iter::once(grade).chain(look).collect();
-        let stack = Stack { input: Profile::Standard, layers, blend: Blend::Chain };
-        Lut3d { title, ..lab::compose(&stack, size, &|_| baked.clone()) }
+        let base = CompareBase { grade, looks: look, input: Profile::Standard };
+        Lut3d { title, ..base.compose(size, &|_| baked.clone()) }
     }
 }
 
@@ -243,7 +241,8 @@ impl CompareBase {
 
 /// `lut` applied after `base`: lut(base(c)) on base's lattice.
 fn after(base: &Lut3d, lut: &Lut3d) -> Lut3d {
-    Lut3d { data: base.data.iter().map(|&c| lut.sample(c)).collect(), ..base.clone() }
+    let data = base.data.iter().map(|&c| lut.sample(c)).collect();
+    Lut3d { title: lut.title.clone(), size: base.size, data, format: lut.format }
 }
 
 pub enum Job {

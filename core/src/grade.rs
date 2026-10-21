@@ -99,6 +99,13 @@ impl Stage {
 }
 
 impl Grade {
+    /// True when only the input decoding remains: every stage is at its neutral value.
+    pub fn is_neutral(&self) -> bool {
+        let mut n = self.clone();
+        Stage::ALL.into_iter().for_each(|s| n.bypass(s));
+        n == *self
+    }
+
     /// Resets `stage` to neutral, leaving the rest of the grade (and the input) as is.
     pub fn bypass(&mut self, stage: Stage) {
         let (p, d, curves) = (&mut self.params, Params::default(), &mut self.curves);

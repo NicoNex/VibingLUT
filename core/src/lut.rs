@@ -65,8 +65,11 @@ pub struct Lut3d {
 
 /// HALD level L for an image side, if the side is L³. Capped at 12
 /// (a 144³ cube, 1728² px): bigger ones cost hundreds of MB for no gain.
+/// Largest HALD level read or written (level 12 = 144³, a 1728² image).
+const MAX_HALD_LEVEL: usize = 12;
+
 fn hald_level(side: u32) -> Option<u32> {
-    (2..=12u32).find(|l| l * l * l == side)
+    (2..=MAX_HALD_LEVEL as u32).find(|l| l * l * l == side)
 }
 
 /// A LUT in the library: everything but the lattice, which is loaded from
@@ -168,8 +171,9 @@ impl Lut3d {
     /// 16-bit HALD CLUT image; requires size = L² (e.g. 64 → level 8, 512×512).
     pub fn to_hald(&self) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>, String> {
         // Same level range the reader accepts, so every HALD we write reads back.
-        let level =
-            (2..=12).find(|l| l * l == self.size).ok_or(format!("{}³ is not a HALD size (L², L ≤ 12)", self.size))?;
+        let level = (2..=MAX_HALD_LEVEL)
+            .find(|l| l * l == self.size)
+            .ok_or(format!("{}³ is not a HALD size (L², L ≤ {MAX_HALD_LEVEL})", self.size))?;
         let side = (level * level * level) as u32;
         let px: Vec<u16> =
             self.data.iter().flat_map(|c| c.map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16)).collect();

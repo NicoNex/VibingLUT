@@ -117,7 +117,7 @@ pub(crate) fn profile_dropdown(selected: Profile) -> gtk::DropDown {
     d
 }
 
-fn caption(text: &str) -> gtk::Label {
+pub(crate) fn caption(text: &str) -> gtk::Label {
     gtk::Label::builder().label(text).css_classes(["caption", "dim-label"]).wrap(true).xalign(0.0).build()
 }
 
