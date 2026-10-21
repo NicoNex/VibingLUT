@@ -101,9 +101,14 @@ impl Stage {
 impl Grade {
     /// True when only the input decoding remains: every stage is at its neutral value.
     pub fn is_neutral(&self) -> bool {
+        self.neutralized() == *self
+    }
+
+    /// Every stage bypassed: only the input decoding remains.
+    pub fn neutralized(&self) -> Self {
         let mut n = self.clone();
         Stage::ALL.into_iter().for_each(|s| n.bypass(s));
-        n == *self
+        n
     }
 
     /// Resets `stage` to neutral, leaving the rest of the grade (and the input) as is.

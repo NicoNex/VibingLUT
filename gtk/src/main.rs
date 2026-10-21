@@ -77,6 +77,8 @@ enum Msg {
     Reload,
     /// A sidebar section switched off/on (`None` = the LUTs after the grade).
     Bypass(Option<Stage>, bool),
+    /// Compare LUTs on the untouched photo instead of on top of the grade.
+    CompareOriginal(bool),
     Preferences,
     Page(Page),
     LayerAdd(Layers, LabAdd),
@@ -138,6 +140,7 @@ struct App {
     /// Sections switched off with their eye toggle; they are left out of preview and export.
     bypassed: Vec<Stage>,
     looks_off: bool,
+    compare_original: bool,
     /// What the Compare base was last built from: grade, looks (by identity), profile.
     base_key: Option<BaseKey>,
     /// Thumbnails need re-rendering (new source or library) next time Compare is shown.
@@ -247,7 +250,12 @@ impl App {
 
     /// Hands the Grade page's result to Compare LUTs; true when it changed.
     fn sync_compare_base(&mut self) -> bool {
-        let (grade, looks, input) = (self.graded(), self.look_layers(), self.source_profile());
+        let input = self.source_profile();
+        let (grade, looks) = if self.compare_original {
+            (self.grade.neutralized(), Vec::new())
+        } else {
+            (self.graded(), self.look_layers())
+        };
         let luts = looks
             .iter()
             .filter_map(|l| match &l.source {
@@ -976,6 +984,14 @@ impl SimpleComponent for App {
         let snd = sender.clone();
         reload.connect_clicked(move |_| snd.input(Msg::Reload));
         folder_row.append(&reload);
+        let original = gtk::ToggleButton::builder()
+            .icon_name("image-x-generic-symbolic")
+            .tooltip_text(gettext("Compare on the original photo, without the Grade edits"))
+            .css_classes(["flat"])
+            .build();
+        let snd = sender.clone();
+        original.connect_toggled(move |b| snd.input(Msg::CompareOriginal(b.is_active())));
+        folder_row.append(&original);
         folder_row.append(&folder_btn);
         let groups = gtk::DropDown::builder().visible(false).margin_start(8).margin_end(8).margin_bottom(4).build();
         groups.update_property(&[gtk::accessible::Property::Label(&gettext("Subfolder"))]);
@@ -1310,6 +1326,7 @@ impl SimpleComponent for App {
             looks: Vec::new(),
             bypassed: Vec::new(),
             looks_off: false,
+            compare_original: false,
             base_key: None,
             gallery_stale: true,
             lab_input: Profile::Standard,
@@ -1459,7 +1476,7 @@ impl SimpleComponent for App {
                     l.reset();
                 }
                 self.ui.sidebar.curves.reset_all();
-                Stage::ALL.into_iter().for_each(|s| self.grade.bypass(s));
+                self.grade = self.grade.neutralized();
                 self.render();
             }
             Msg::Compare(on) => {
@@ -1626,6 +1643,10 @@ impl SimpleComponent for App {
             Msg::Bypass(None, off) => {
                 self.looks_off = off;
                 self.layers_changed(Layers::Look, false, &sender);
+            }
+            Msg::CompareOriginal(on) => {
+                self.compare_original = on;
+                self.refresh();
             }
             Msg::Reload => match settings::folder(settings::LUT_FOLDER) {
                 Some(dir) => sender.input(Msg::Folder(dir)),
