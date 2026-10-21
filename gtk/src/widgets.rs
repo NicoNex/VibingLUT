@@ -29,7 +29,12 @@ impl Slider {
 
         let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let name = gtk::Label::builder().label(label).xalign(0.0).hexpand(true).css_classes(["slider-label"]).build();
-        let value = gtk::Label::builder().css_classes(["numeric", "slider-value"]).width_chars(6).xalign(1.0).build();
+        // Click the number to type a value; Enter commits, Escape cancels.
+        let value = gtk::EditableLabel::builder().css_classes(["numeric", "slider-value"]).build();
+        value.set_width_chars(6);
+        value.set_max_width_chars(6);
+        value.set_alignment(1.0);
+        value.update_property(&[gtk::accessible::Property::Label(label)]);
         let reset = gtk::Button::builder()
             .icon_name("edit-undo-symbolic")
             .css_classes(["flat", "circular", "slider-reset"])
@@ -49,18 +54,33 @@ impl Slider {
         root.append(&head);
         root.append(&scale);
 
+        let shown = move |v: f64| format!("{:.*}", digits as usize, v);
         let sync = {
             let (value, reset) = (value.clone(), reset.clone());
             move |a: &gtk::Adjustment| {
-                value.set_label(&format!("{:.*}", digits as usize, a.value()));
+                value.set_text(&shown(a.value()));
                 let changed = (a.value() - default).abs() > 1e-9;
                 reset.set_opacity(if changed { 1.0 } else { 0.0 });
                 reset.set_sensitive(changed);
             }
         };
         sync(&adj);
-        adj.connect_value_changed(sync);
+        adj.connect_value_changed(sync.clone());
 
+        let a = adj.clone();
+        value.connect_editing_notify(move |v| {
+            if !v.is_editing() {
+                // Accept "0,5" as well as "0.5"; set_value clamps to the range.
+                // Unchanged text (Escape, click away) keeps the unrounded value.
+                let text = v.text().trim().replace(',', ".");
+                if text != shown(a.value())
+                    && let Some(x) = text.parse::<f64>().ok().filter(|x| x.is_finite())
+                {
+                    a.set_value(x);
+                }
+                sync(&a); // reformat, or restore the old value on bad input
+            }
+        });
         let a = adj.clone();
         reset.connect_clicked(move |_| a.set_value(default));
         // Double-click the track to reset, like every grading app.
