@@ -221,10 +221,37 @@ impl Gpu {
 
 // ------------------------------------------------------------------ worker
 
+/// What Compare LUTs shows candidate LUTs on: the Grade page's result,
+/// handed back to each LUT in the source's own signal.
+#[derive(Clone, Debug)]
+pub struct CompareBase {
+    pub grade: Grade,
+    pub looks: Vec<Layer>,
+    /// Profile of the source signal, which the compared LUTs expect.
+    pub input: Profile,
+}
+
+impl CompareBase {
+    /// grade → looks → back to `input`, on an N³ lattice.
+    fn compose(&self, size: usize, bake: &dyn Fn(&Grade) -> Arc<Lut3d>) -> Lut3d {
+        let grade = Layer { source: Source::Grade(Box::new(self.grade.clone())), intensity: 1.0, input: self.input };
+        let back = Layer { source: Source::Convert(self.input), intensity: 1.0, input: self.input };
+        let layers = std::iter::once(grade).chain(self.looks.iter().cloned()).chain([back]).collect();
+        lab::compose(&Stack { input: self.input, layers, blend: Blend::Chain }, size, bake)
+    }
+}
+
+/// `lut` applied after `base`: lut(base(c)) on base's lattice.
+fn after(base: &Lut3d, lut: &Lut3d) -> Lut3d {
+    Lut3d { data: base.data.iter().map(|&c| lut.sample(c)).collect(), ..base.clone() }
+}
+
 pub enum Job {
     SetPhoto(Arc<Photo>),
     /// LUTs applied after the grade on the Grade page (empty = none).
     SetLook(Vec<Layer>),
+    /// Base of the Compare LUTs previews; None = the ungraded source.
+    SetCompareBase(Option<CompareBase>),
     Render(Grade, f32),
     /// The photo through the LUT file at `path` (kept on the GPU while selected).
     ApplyLut(PathBuf, f32),
@@ -297,6 +324,8 @@ struct Worker {
     selected: Option<(PathBuf, GpuLut)>,
     /// Composite of the Grade page's look LUTs.
     look: Option<GpuLut>,
+    /// Compare base composed at 33³ (thumbnails) and 65³ (large preview).
+    base: Option<(Lut3d, Lut3d)>,
     /// Thumbnail pass in progress: generation, LUT files, next index.
     gallery: Option<(u64, Arc<Vec<PathBuf>>, usize)>,
     /// Last grade baked for the Lab, reused until the grade changes.
@@ -312,6 +341,10 @@ impl Worker {
         let (generation, i) = (*generation, *index);
         *index += 1;
         if let Some(Ok(lut)) = paths.get(i).map(|p| Lut3d::load(p)) {
+            let lut = match &self.base {
+                Some((small, _)) => after(small, &lut),
+                None => lut,
+            };
             let rgba = gpu.apply_lut(th, &gpu.upload_lut(&lut), 0.0);
             notify(Done::Thumb { generation, index: i, width: th.width, height: th.height, rgba });
         }
@@ -350,6 +383,13 @@ impl Worker {
                     gpu.upload_lut(&lab::compose(&stack, 33, &|g| self.bake_cached(gpu, g)))
                 });
             }
+            Job::SetCompareBase(base) => {
+                self.base = base.map(|b| {
+                    let bake = |g: &Grade| self.bake_cached(gpu, g);
+                    (b.compose(33, &bake), b.compose(lab::SOURCE_SIZE, &bake))
+                });
+                self.selected = None; // its GPU LUT was folded into the old base
+            }
             Job::Render(grade, split) => {
                 let Some(ph) = &self.photo else { return };
                 let rgba = gpu.render(ph, &grade, self.look.as_ref(), split);
@@ -360,7 +400,13 @@ impl Worker {
                 let Some(ph) = &self.photo else { return };
                 if self.selected.as_ref().is_none_or(|(p, _)| *p != path) {
                     match Lut3d::load(&path) {
-                        Ok(l) => self.selected = Some((path, gpu.upload_lut(&l))),
+                        Ok(l) => {
+                            let l = match &self.base {
+                                Some((_, large)) => after(large, &l),
+                                None => l,
+                            };
+                            self.selected = Some((path, gpu.upload_lut(&l)))
+                        }
                         Err(_) => return,
                     }
                 }
@@ -497,6 +543,27 @@ mod tests {
                 assert!((a[k] - b[k]).abs() < 1e-4, "identity look changed {a:?} → {b:?}");
                 assert!((1.0 - a[k].clamp(0.0, 1.0) - c[k]).abs() < 1e-3, "look not applied: {a:?} → {c:?}");
             }
+        }
+    }
+
+    /// With a neutral grade the Compare base is the identity, so a compared
+    /// LUT looks as it does on the ungraded photo; a graded base feeds it lut(grade).
+    #[test]
+    fn compare_base_puts_the_grade_before_the_lut() {
+        let Ok(gpu) = Gpu::new() else { return eprintln!("no GPU, skipped") };
+        let bake = |g: &Grade| Arc::new(gpu.bake(g, lab::SOURCE_SIZE, String::new()));
+        let neutral = CompareBase { grade: Grade::default(), looks: Vec::new(), input: Profile::Standard };
+        for (v, e) in neutral.compose(17, &bake).data.iter().zip(&Lut3d::identity(17, Format::Cube).data) {
+            assert!((0..3).all(|k| (v[k] - e[k]).abs() < 1e-3), "{v:?} vs {e:?}");
+        }
+        let mut grade = Grade::default();
+        grade.params.exposure = 0.4;
+        let base = CompareBase { grade: grade.clone(), looks: Vec::new(), input: Profile::Standard };
+        let mut inverted = Lut3d::identity(17, Format::Cube);
+        inverted.data.iter_mut().for_each(|c| *c = c.map(|v| 1.0 - v));
+        let shown = after(&base.compose(17, &bake), &inverted);
+        for (s, g) in shown.data.iter().zip(&gpu.bake(&grade, 17, String::new()).data) {
+            assert!((0..3).all(|k| (s[k] - (1.0 - g[k].clamp(0.0, 1.0))).abs() < 2e-3), "{s:?} vs inverted {g:?}");
         }
     }
 

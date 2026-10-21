@@ -21,7 +21,7 @@ use relm4::adw::prelude::*;
 use relm4::gtk::{gdk, gio, glib};
 use relm4::{ComponentParts, ComponentSender, RelmApp, SimpleComponent, adw, gtk};
 use vibinglut_core::chart::test_chart;
-use vibinglut_core::gpu::{self, Done, Job};
+use vibinglut_core::gpu::{self, CompareBase, Done, Job};
 use vibinglut_core::grade::{BAND_HUE_RANGE, BAND_HUES, Curve, Grade, Params, Stage};
 use vibinglut_core::lab::{Blend, Layer, Source, Stack, oklch_to_srgb};
 use vibinglut_core::lut::{Format, Lut3d, LutEntry, MAX_LIBRARY};
@@ -138,6 +138,8 @@ struct App {
     /// Sections switched off with their eye toggle; they are left out of preview and export.
     bypassed: Vec<Stage>,
     looks_off: bool,
+    /// What the Compare base was last built from: grade, looks (by identity), profile.
+    base_key: Option<BaseKey>,
     lab_input: Profile,
     lab_blend: Blend,
     profile: Profile,
@@ -240,7 +242,31 @@ impl App {
         }
     }
 
+    /// Hands the Grade page's result to Compare LUTs; true when it changed.
+    fn sync_compare_base(&mut self) -> bool {
+        let (grade, looks, input) = (self.graded(), self.look_layers(), self.source_profile());
+        let ids = looks
+            .iter()
+            .map(|l| match &l.source {
+                Source::Lut(lut) => (Arc::as_ptr(lut) as usize, l.intensity.to_bits(), l.input),
+                _ => (0, 0, l.input),
+            })
+            .collect();
+        let key = Some((grade.clone(), ids, input));
+        if self.base_key == key {
+            return false;
+        }
+        self.base_key = key;
+        let mut neutral = Grade::default();
+        (neutral.params.input, neutral.params.gamut) = (grade.params.input, grade.params.gamut);
+        // ponytail: an untouched grade keeps the exact direct path (no lattice round trip).
+        let base = (grade != neutral || !looks.is_empty()).then_some(CompareBase { grade, looks, input });
+        self.send(Job::SetCompareBase(base));
+        true
+    }
+
     fn render_gallery(&mut self) {
+        self.sync_compare_base();
         if self.has_source() && !self.luts.is_empty() {
             self.gallery_gen += 1;
             self.send(Job::Gallery(self.gallery_gen, self.lut_paths.clone()));
@@ -251,7 +277,12 @@ impl App {
     fn refresh(&mut self) {
         match self.page {
             Page::Grade => self.render(),
-            Page::Compare => self.render_compare(),
+            Page::Compare => {
+                if self.sync_compare_base() {
+                    self.render_gallery();
+                }
+                self.render_compare()
+            }
             Page::Lab => self.render_lab(),
         }
     }
@@ -1288,6 +1319,7 @@ impl SimpleComponent for App {
             looks: Vec::new(),
             bypassed: Vec::new(),
             looks_off: false,
+            base_key: None,
             lab_input: Profile::Standard,
             lab_blend: Blend::Chain,
             profile: Profile::Standard,
@@ -1839,6 +1871,9 @@ fn locale_dir() -> PathBuf {
         .filter(|d| d.join("it/LC_MESSAGES/vibinglut.mo").exists())
         .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/locale")))
 }
+
+/// Grade, look LUTs (pointer, intensity bits, profile) and source profile.
+type BaseKey = (Grade, Vec<(usize, u32, Profile)>, Profile);
 
 thread_local! {
     /// The window's input, for files opened through the application (see `main`).
