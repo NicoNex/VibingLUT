@@ -7,9 +7,15 @@ use std::sync::Arc;
 
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, Rgba32FImage};
+use rawler::imgop::chromatic_adaption::bradford_adaption_matrix;
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
+#[cfg(test)]
+use rawler::imgop::matrix::IDENTITY_MATRIX_3;
 pub use rawler::imgop::matrix::multiply_row1;
+use rawler::imgop::matrix::{multiply, normalize, pseudo_inverse, transform_1d};
 pub use rawler::imgop::srgb::{srgb_apply_gamma, srgb_invert_gamma};
+use rawler::imgop::xyz::{Illuminant, SRGB_TO_XYZ_D65};
+use rayon::prelude::*;
 
 use crate::profiles::Profile;
 
@@ -108,27 +114,31 @@ impl Photo {
 }
 
 /// Integer-factor box filter over any pixel type convertible to RGBA.
-fn box_downscale<T>(src: &[T], width: u32, height: u32, max: u32, rgba: impl Fn(&T) -> [f32; 4]) -> Photo {
+/// Output rows run in parallel.
+fn box_downscale<T: Sync>(src: &[T], width: u32, height: u32, max: u32, rgba: impl Fn(&T) -> [f32; 4] + Sync) -> Photo {
     let f = width.max(height).div_ceil(max).max(1);
     let (w, h) = ((width / f).max(1), (height / f).max(1));
     let norm = 1.0 / (f * f) as f32;
-    let mut pixels = Vec::with_capacity((w * h) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = [0.0f32; 4];
-            let (rows, cols) = (f.min(height - y * f), f.min(width - x * f));
-            for dy in 0..rows {
-                let row = ((y * f + dy) * width + x * f) as usize;
-                for p in &src[row..row + cols as usize] {
-                    let p = rgba(p);
-                    for c in 0..4 {
-                        acc[c] += p[c];
+    let rgba = &rgba;
+    let pixels = (0..h)
+        .into_par_iter()
+        .flat_map_iter(|y| {
+            (0..w).map(move |x| {
+                let mut acc = [0.0f32; 4];
+                let (rows, cols) = (f.min(height - y * f), f.min(width - x * f));
+                for dy in 0..rows {
+                    let row = ((y * f + dy) * width + x * f) as usize;
+                    for p in &src[row..row + cols as usize] {
+                        let p = rgba(p);
+                        for c in 0..4 {
+                            acc[c] += p[c];
+                        }
                     }
                 }
-            }
-            pixels.push(acc.map(|v| v * norm));
-        }
-    }
+                acc.map(|v| v * norm)
+            })
+        })
+        .collect();
     Photo { width: w, height: h, pixels }
 }
 
@@ -160,23 +170,16 @@ fn load_raw(path: &Path) -> Result<Photo, String> {
         .ok()
         .and_then(|m| m.exif.orientation)
         .unwrap_or_else(|| raw.orientation.to_u16());
-    // Everything but the final sRGB encode: we want linear camera-calibrated RGB.
-    let dev = RawDevelop::new_with(&[
-        ProcessingStep::Rescale,
-        ProcessingStep::Demosaic,
-        ProcessingStep::FujiRotate,
-        ProcessingStep::CropActiveArea,
-        ProcessingStep::WhiteBalance,
-        ProcessingStep::Calibrate,
-        ProcessingStep::CropDefault,
-    ]);
-    let Intermediate::ThreeColor(rgb) = dev.develop_intermediate(&raw).map_err(|e| e.to_string())? else {
-        return Err("unsupported sensor layout".into());
+    // Demosaiced camera RGB, 1.0 = sensor clip. White balance and the colour
+    // matrix are ours (see `Calibration`): rawler's Calibrate folds every
+    // value above 1.0 back down, which bands and tints bright skies.
+    use ProcessingStep::*;
+    let dev = RawDevelop::new_with(&[Rescale, Demosaic, FujiRotate, CropActiveArea, CropDefault]);
+    let linear = match dev.develop_intermediate(&raw).map_err(|e| e.to_string())? {
+        Intermediate::ThreeColor(px) => calibrated(&raw, &px.data, px.width, px.height),
+        Intermediate::FourColor(px) => calibrated(&raw, &px.data, px.width, px.height),
+        Intermediate::Monochrome(_) => return Err("unsupported sensor layout".into()),
     };
-    let (w, h) = (rgb.dim().w as u32, rgb.dim().h as u32);
-    // Downscale straight from the 3-channel buffer: a full-size RGBA copy
-    // would add ~400 MB of peak memory on a 24 MP file.
-    let linear = box_downscale(&rgb.data, w, h, PREVIEW_MAX, |p| [p[0], p[1], p[2], 1.0]);
     // Downscale in linear light (physically correct averaging), then encode.
     let orientation = Orientation::from_exif(exif_orientation as u8).unwrap_or(Orientation::NoTransforms);
     let mut img = DynamicImage::ImageRgba32F(linear.to_image());
@@ -188,7 +191,57 @@ fn load_raw(path: &Path) -> Result<Photo, String> {
     Ok(photo)
 }
 
-/// Scene-linear scale of rawler output: Lumix RAWs sit ~0.8 EV under scene grey.
+/// Calibrates while downscaling, straight from the camera buffer: a
+/// full-size RGBA copy would add ~400 MB of peak memory on a 24 MP file.
+fn calibrated<const N: usize>(raw: &rawler::RawImage, px: &[[f32; N]], width: usize, height: usize) -> Photo {
+    let cal = Calibration::<N>::new(raw);
+    box_downscale(px, width as u32, height as u32, PREVIEW_MAX, |p| {
+        let [r, g, b] = cal.apply(p);
+        [r, g, b, 1.0]
+    })
+}
+
+/// Camera RGB (N = 3) or CYGM/RGBE (N = 4) → linear Rec.709, with clipped
+/// highlights kept neutral.
+struct Calibration<const N: usize> {
+    wb: [f32; N],
+    cam2rgb: [[f32; N]; 3],
+}
+
+impl<const N: usize> Calibration<N> {
+    fn new(raw: &rawler::RawImage) -> Self {
+        let wb: [f32; N] =
+            std::array::from_fn(|c| if raw.wb_coeffs[0].is_nan() { 1.0 } else { raw.wb_coeffs[c] / raw.wb_coeffs[1] });
+        use Illuminant::*;
+        let xyz2cam = raw
+            .color_matrix_find_first([D65, A, B, C, D50, D55, D75, Daylight, Flash])
+            .and_then(|(illu, m)| {
+                let m = transform_1d::<N, 3>(m.get(..N * 3)?)?;
+                Some(if illu == D65 { m } else { multiply(&m, &bradford_adaption_matrix(&illu, &D65)) })
+            })
+            .unwrap_or(std::array::from_fn(|i| std::array::from_fn(|j| if i == j { 1.0 } else { 0.0 })));
+        // Same derivation as rawler: rows normalised so camera white maps to RGB white.
+        let cam2rgb = pseudo_inverse(normalize(multiply(&xyz2cam, &SRGB_TO_XYZ_D65)));
+        Self { wb, cam2rgb }
+    }
+
+    fn apply(&self, p: &[f32; N]) -> [f32; 3] {
+        let cam: [f32; N] = std::array::from_fn(|c| p[c] * self.wb[c]);
+        let rgb = self.cam2rgb.map(|row| row.iter().zip(&cam).map(|(m, v)| m * v).sum::<f32>());
+        // A clipped channel has lost its true value, so its hue is wrong
+        // (white balance turns clipped skies magenta). Fade to neutral over
+        // the last 15% before clip: wide enough that no edge appears (5% shows one).
+        // ponytail: also pales vivid colours that come close to clip;
+        // highlight reconstruction (inpainting from neighbours) would keep them.
+        let t = ((p.iter().copied().fold(0.0, f32::max) - 0.85) / 0.15).clamp(0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t);
+        // The brightest channel, since unclipped ones still carry the detail.
+        let white = cam.iter().copied().fold(0.0, f32::max);
+        rgb.map(|v| (v + (white - v) * t).max(0.0))
+    }
+}
+
+/// Scene-linear scale of the calibrated RAW: Lumix RAWs sit ~0.8 EV under scene grey.
 const RAW_TO_SCENE: f32 = 1.76;
 const VIEW_EXPOSURE: f32 = 1.25;
 const VIEW_WHITE: f32 = 6.0; // exposed scene value mapped to display white
@@ -221,6 +274,16 @@ pub fn inverse_view_transform(display_linear: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A green-clipped pixel comes out neutral, and the fade has no step.
+    #[test]
+    fn clipped_highlights_are_neutral_and_smooth() {
+        let cal = Calibration { wb: [2.0, 1.0, 1.7], cam2rgb: IDENTITY_MATRIX_3 };
+        let [r, g, b] = cal.apply(&[0.4, 1.0, 0.5]);
+        assert!(r == g && g == b, "{r} {g} {b}");
+        let (lo, hi) = (cal.apply(&[0.3, 0.8499, 0.4]), cal.apply(&[0.3, 0.8501, 0.4]));
+        assert!((0..3).all(|c| (lo[c] - hi[c]).abs() < 1e-3), "{lo:?} {hi:?}");
+    }
 
     /// Portrait RAWs must come out portrait. Uses local sample files when
     /// present (set VIBINGLUT_PORTRAIT_RAW), otherwise skips.

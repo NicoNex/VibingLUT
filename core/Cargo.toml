@@ -10,5 +10,6 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff"] }
 pollster = "1.0.1"
 rawler = "0.8"
+rayon = "1.12"
 # Native backends only (Vulkan / Metal / DX12): no WebGPU/WebGL/GLES.
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "metal", "dx12"] }
